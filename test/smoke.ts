@@ -1299,7 +1299,7 @@ async function testGrok46CatalogAndRouting(
   assertEqual(catalogEntry.limit.output, 64_000, "Catalog entry output limit");
   assertEqual(catalogEntry.cost.input, 2, "grok-4.6 input cost must be $2/M, not the generic grok pattern");
   assertEqual(catalogEntry.cost.output, 6, "grok-4.6 output cost must be $6/M, not the generic grok pattern");
-  assertEqual(catalogEntry.cost.cache.read, 0.2, "grok-4.6 cached-read cost must be $0.20/M");
+  assertEqual(catalogEntry.cost.cache.read, 0.5, "grok-4.6 cached-read cost must be $0.50/M");
   assertEqual(catalogEntry.cost.cache.write, 0, "grok-4.6 cache-write cost must be $0/M");
   assertEqual(catalogEntry.capabilities.attachment, false, "grok-4.6 must stay text-only for attachments");
   assertEqual(catalogEntry.capabilities.input.image, false, "grok-4.6 must stay text-only for images");
@@ -1326,7 +1326,7 @@ async function testGrok46CatalogAndRouting(
     assertEqual(configEntry.limit.output, 64_000, "Config entry output limit");
     assertEqual(configEntry.cost.input, 2, "Config entry input cost must be $2/M");
     assertEqual(configEntry.cost.output, 6, "Config entry output cost must be $6/M");
-    assertEqual(configEntry.cost.cache_read, 0.2, "Config entry cached-read cost must be $0.20/M");
+    assertEqual(configEntry.cost.cache_read, 0.5, "Config entry cached-read cost must be $0.50/M");
     assertEqual(configEntry.cost.cache_write, 0, "Config entry cache-write cost must be $0/M");
   } finally {
     delete process.env.OPENCODE_AUTH_CONTENT;
