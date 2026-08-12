@@ -36,6 +36,21 @@ This opens Cursor OAuth in the browser. Tokens are stored in
 Start OpenCode and select any Cursor model. The plugin starts a local
 OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
 
+## Models
+
+Grok 4.6 is supported. The plugin registers it as `grok-4.6` in the fallback
+model catalog, and live discovery returns whatever models Cursor serves.
+
+- Default context: 256K tokens (Cursor-facing default)
+- Reasoning: supported — Cursor lists Grok 4.6 with Agent + Thinking
+- Short-context pricing: $2 input / $6 output per million tokens
+
+The plugin proxies Cursor's Connect API, so model metadata mirrors Cursor's
+published surface. The xAI direct API advertises a 500K window and accepts
+image input; neither applies to this plugin, which is text-in / text-out for
+every model. Image and vision input are never forwarded, so Grok 4.6 is
+text-only here.
+
 ## How it works
 
 1. OAuth — browser-based login to Cursor via PKCE.
