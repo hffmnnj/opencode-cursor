@@ -168,8 +168,6 @@ tokens or headers, cookies, prompt/message text, tool arguments/results, or blob
 The parent always drains child stderr even while diagnostics are disabled, preventing pipe
 backpressure from stalling the bridge.
 
-## Evidence sources
-
 ## Interaction-query disposition
 
 Adapted with attribution to `tanushshukla/opencode-cursor@a067e099`: an unanswered
@@ -189,6 +187,8 @@ The smoke fixture proves a rejected web-search query continues on the same turn 
 clean `turnEnded` terminal. It also proves `execServerControlMessage` produces exactly one
 explicit error and one `[DONE]`; classification tests cover every generated safe refusal plus
 the VM fail-fast boundary.
+
+## Evidence sources
 
 - Field notes: unhandled server-message families / raw-byte timer resets (leading hang
   hypothesis); every stream-termination path; timers/watchdogs and reset semantics;
