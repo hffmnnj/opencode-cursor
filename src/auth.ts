@@ -37,12 +37,14 @@ export type LifecycleDiagnosticStage =
   | "auth_access_start" | "auth_access_complete"
   | "auth_refresh_start" | "auth_refresh_complete" | "auth_refresh_failed"
   | "proxy_entry" | "bridge_spawn" | "connect_frame" | "end_stream"
-  | "message_dispatch"
+  | "message_dispatch" | "outbound_model" | "turn_ended"
   | "tool_pause" | "tool_resume" | "sse_emission" | "terminal";
 
 type LifecycleDiagnosticDetails = Readonly<{
   byteLength?: number; messageCase?: string; interactionCase?: string;
   toolCount?: number; exitCode?: number; errorName?: string; status?: string;
+  modelId?: string; transportState?: "connecting" | "writable" | "closed" | "failed";
+  writable?: boolean;
 }>;
 
 /** Diagnostics are opt-in because even safe metadata is operational noise. */
@@ -71,7 +73,7 @@ export function emitLifecycleDiagnostic(
   const store = lifecycleDiagnosticContext.getStore();
   if (!store || store.emittedStages.has(stage)) return;
   store.emittedStages.add(stage);
-  const event: Record<string, string | number> = { source, stage, requestId: context.requestId, elapsedMs: context.elapsedMs };
+  const event: Record<string, string | number | boolean> = { source, stage, requestId: context.requestId, elapsedMs: context.elapsedMs };
   if (typeof details.byteLength === "number") event.byteLength = details.byteLength;
   if (typeof details.messageCase === "string") event.messageCase = details.messageCase;
   if (typeof details.interactionCase === "string") event.interactionCase = details.interactionCase;
@@ -79,6 +81,9 @@ export function emitLifecycleDiagnostic(
   if (typeof details.exitCode === "number") event.exitCode = details.exitCode;
   if (typeof details.errorName === "string") event.errorName = details.errorName;
   if (typeof details.status === "string") event.status = details.status;
+  if (typeof details.modelId === "string") event.modelId = details.modelId;
+  if (typeof details.transportState === "string") event.transportState = details.transportState;
+  if (typeof details.writable === "boolean") event.writable = details.writable;
   console.error(JSON.stringify(event));
 }
 

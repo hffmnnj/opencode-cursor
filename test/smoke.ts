@@ -669,6 +669,7 @@ async function testFakeCursorScenarioHarness() {
 interface SseObservation {
   body: string;
   timedOut: boolean;
+  diagnostics: string[];
 }
 
 function doneCount(body: string): number {
@@ -726,7 +727,7 @@ async function observeProxyScenario(
       new Response(child.stderr).text(),
     ]);
     assertEqual(exitCode, 0, `Scenario subprocess failed (${scenario}): ${stderr}`);
-    return JSON.parse(stdout.trim()) as SseObservation;
+    return { ...JSON.parse(stdout.trim()) as Omit<SseObservation, "diagnostics">, diagnostics: stderr.trim().split("\n").filter(Boolean) };
   } finally {
     await fixture.close();
   }
@@ -1289,9 +1290,22 @@ async function testLifecycleDiagnostics(modules: TestModules) {
     for (const stage of [
       "proxy_entry", "auth_access_start", "auth_access_complete", "bridge_spawn",
       "bridge_start", "h2_connect", "connect_stream", "bridge_data", "connect_frame",
-      "message_dispatch", "sse_emission", "terminal",
+      "message_dispatch", "outbound_model", "sse_emission", "terminal",
     ]) {
       assert(stages.has(stage), `Missing diagnostic lifecycle stage: ${stage}`);
+    }
+    const outboundModel = events.find((event) => event.stage === "outbound_model");
+    assertEqual(outboundModel?.modelId, "test", "Outbound diagnostic must expose the selected Cursor wire model ID");
+    const allowedKeys = new Set([
+      "source", "stage", "requestId", "elapsedMs", "byteLength", "messageCase", "interactionCase",
+      "toolCount", "exitCode", "errorName", "status", "modelId", "transportState", "writable",
+      "parentElapsedMs",
+    ]);
+    for (const event of events) {
+      for (const [key, value] of Object.entries(event)) {
+        assert(allowedKeys.has(key), `Diagnostic event emitted non-allowlisted key: ${key}`);
+        assert(["string", "number", "boolean"].includes(typeof value), `Diagnostic value must be scalar: ${key}`);
+      }
     }
     const requestIds = new Set(events.map((event) => event.requestId));
     assertEqual(requestIds.size, 1, "Expected one shared diagnostic correlation ID");
@@ -1299,6 +1313,19 @@ async function testLifecycleDiagnostics(modules: TestModules) {
     const output = enabled.lines.join("\n");
     for (const secret of [fakeToken, secretPrompt, secretToolPayload]) {
       assert(!output.includes(secret), `Diagnostic output leaked secret: ${secret}`);
+    }
+
+    const turnEnded = await observeProxyScenario("turn-ended-transport-close", 125, {
+      CURSOR_PROXY_DIAGNOSTICS: "1",
+    });
+    const turnEndedEvents = turnEnded.diagnostics.map((line) => JSON.parse(line) as Record<string, unknown>);
+    const turnEndedEvent = turnEndedEvents.find((event) => event.stage === "turn_ended");
+    assert(turnEndedEvent, "turnEnded dispatch must emit a lifecycle diagnostic");
+    assertEqual(turnEndedEvent.transportState, "writable", "turnEnded diagnostic must capture pre-cleanup transport state");
+    assertEqual(turnEndedEvent.writable, true, "turnEnded diagnostic must capture pre-cleanup writability");
+    const turnEndedOutput = turnEnded.diagnostics.join("\n");
+    for (const secret of ["test-token", "reproduce termination behavior"]) {
+      assert(!turnEndedOutput.includes(secret), `turnEnded diagnostic leaked secret or prompt: ${secret}`);
     }
   } finally {
     if (originalSetting === undefined) delete process.env.CURSOR_PROXY_DIAGNOSTICS;
