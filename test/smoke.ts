@@ -6,16 +6,20 @@ import {
   AgentServerMessageSchema,
   ConversationStateStructureSchema,
   ExecServerControlMessageSchema,
+  ExecServerMessageSchema,
   GetBlobArgsSchema,
   GetUsableModelsResponseSchema,
   HeartbeatUpdateSchema,
   InteractionQuerySchema,
   InteractionUpdateSchema,
   KvServerMessageSchema,
+  McpArgsSchema,
   ModelDetailsSchema,
   TextDeltaUpdateSchema,
   SetupVmEnvironmentArgsSchema,
   ThinkingDetailsSchema,
+  ThinkingDeltaUpdateSchema,
+  TokenDeltaUpdateSchema,
   TurnEndedUpdateSchema,
 } from "../src/proto/agent_pb";
 import {
@@ -826,6 +830,30 @@ async function testServerMessageClassification(modules: TestModules) {
   }) } });
   assertEqual(state.semanticProgressCount, 1, "Text output must count as semantic progress");
 
+  dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
+    message: { case: "thinkingDelta", value: create(ThinkingDeltaUpdateSchema, { text: "reasoning" }) },
+  }) } });
+  dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
+    message: { case: "tokenDelta", value: create(TokenDeltaUpdateSchema, { tokens: 1 }) },
+  }) } });
+  dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
+    message: { case: "tokenDelta", value: create(TokenDeltaUpdateSchema, { tokens: 0 }) },
+  }) } });
+  dispatch({ message: { case: "execServerMessage", value: create(ExecServerMessageSchema, {
+    id: 1,
+    execId: "semantic-progress-exec",
+    message: {
+      case: "mcpArgs",
+      value: create(McpArgsSchema, {
+        name: "fixture-tool",
+        toolName: "fixture-tool",
+        toolCallId: "semantic-progress-call",
+        args: { input: new TextEncoder().encode("{}") },
+      }),
+    },
+  }) } });
+  assertEqual(state.semanticProgressCount, 4, "Thinking, positive token deltas, and exec transitions must count as semantic progress");
+
   let unsupportedError: Error | undefined;
   const safeQueryCases = [
     "webSearchRequestQuery",
@@ -844,6 +872,7 @@ async function testServerMessageClassification(modules: TestModules) {
     assert(!unsupportedError, `${queryCase} must be safely refused rather than terminal`);
     assert(responseBytes && responseBytes.length > 5, `${queryCase} must emit a typed interaction response`);
   }
+  assertEqual(state.semanticProgressCount, 4, "Interaction queries must not count as semantic progress");
   dispatch({ message: { case: "interactionQuery", value: create(InteractionQuerySchema, {
     id: 1,
     query: { case: "setupVmEnvironmentArgs", value: create(SetupVmEnvironmentArgsSchema, {}) },
