@@ -1207,6 +1207,139 @@ async function testDiscoveryFallbackAndSuccess(
   console.log("[test] Discovery fallback and success OK");
 }
 
+async function testGrok46CatalogAndRouting(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing Grok 4.6 catalog exposure, cost, and routing...");
+
+  // Fallback discovery exposes grok-4.6 with the Cursor-facing metadata and
+  // leaves grok-code-fast-1 untouched.
+  modules.clearModelCache();
+  backend.setDiscoveryMode("empty");
+  const fallback = await modules.getCursorModels("test-token");
+  const grok46 = fallback.find((model) => model.id === "grok-4.6");
+  assert(grok46, "Fallback discovery must expose grok-4.6");
+  assertEqual(grok46.name, "Grok 4.6", "grok-4.6 fallback display name");
+  assertEqual(grok46.reasoning, true, "grok-4.6 fallback must be reasoning-enabled");
+  assertEqual(grok46.contextWindow, 256_000, "grok-4.6 fallback must use the Cursor-facing 256K context");
+  assertEqual(grok46.maxTokens, 64_000, "grok-4.6 fallback max tokens");
+  const grokCodeFast = fallback.find((model) => model.id === "grok-code-fast-1");
+  assert(grokCodeFast, "Fallback discovery must keep grok-code-fast-1");
+  assertEqual(grokCodeFast.reasoning, false, "grok-code-fast-1 must stay non-reasoning");
+  assertEqual(grokCodeFast.contextWindow, 128_000, "grok-code-fast-1 must keep its 128K context");
+
+  // The v2 catalog hook (auth.loader -> provider.models) emits a complete
+  // Grok 4.6 entry: limits, reasoning flag, explicit cost, text-only caps.
+  const authState = {
+    type: "oauth" as const,
+    access: makeJwt(Math.floor(Date.now() / 1000) + 3600),
+    refresh: "valid-refresh",
+    expires: Date.now() + 3_600_000,
+  };
+  const hooks = await modules.CursorAuthPlugin({
+    client: { auth: { set: async () => {} } },
+  } as any);
+  const provider = { models: {} } as any;
+  modules.clearModelCache();
+  backend.setDiscoveryMode("empty");
+  const catalogConfig = await hooks.auth!.loader(async () => authState, provider);
+  assert(catalogConfig.baseURL, "Catalog hook must start the proxy");
+  const catalogEntry = (provider.models as Record<string, any>)["grok-4.6"];
+  assert(catalogEntry, "Catalog hook must emit a grok-4.6 entry");
+  assertEqual(catalogEntry.name, "Grok 4.6", "Catalog entry display name");
+  assertEqual(catalogEntry.capabilities.reasoning, true, "Catalog entry must advertise reasoning");
+  assertEqual(catalogEntry.limit.context, 256_000, "Catalog entry context limit");
+  assertEqual(catalogEntry.limit.output, 64_000, "Catalog entry output limit");
+  assertEqual(catalogEntry.cost.input, 2, "grok-4.6 input cost must be $2/M, not the generic grok pattern");
+  assertEqual(catalogEntry.cost.output, 6, "grok-4.6 output cost must be $6/M, not the generic grok pattern");
+  assertEqual(catalogEntry.cost.cache.read, 0.2, "grok-4.6 cached-read cost must be $0.20/M");
+  assertEqual(catalogEntry.cost.cache.write, 0, "grok-4.6 cache-write cost must be $0/M");
+  assertEqual(catalogEntry.capabilities.attachment, false, "grok-4.6 must stay text-only for attachments");
+  assertEqual(catalogEntry.capabilities.input.image, false, "grok-4.6 must stay text-only for images");
+
+  // The config hook (opencode >= 1.18 config schema) emits the same entry.
+  modules.clearModelCache();
+  backend.setDiscoveryMode("empty");
+  process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({
+    cursor: {
+      type: "oauth",
+      refresh: "valid-refresh",
+      access: makeJwt(Math.floor(Date.now() / 1000) + 3600),
+      expires: Date.now() + 3_600_000,
+    },
+  });
+  try {
+    const cfg: any = { provider: {} };
+    await hooks.config!(cfg);
+    const configEntry = cfg.provider?.cursor?.models?.["grok-4.6"];
+    assert(configEntry, "Config hook must emit a grok-4.6 entry");
+    assertEqual(configEntry.name, "Grok 4.6", "Config entry display name");
+    assertEqual(configEntry.reasoning, true, "Config entry must advertise reasoning");
+    assertEqual(configEntry.limit.context, 256_000, "Config entry context limit");
+    assertEqual(configEntry.limit.output, 64_000, "Config entry output limit");
+    assertEqual(configEntry.cost.input, 2, "Config entry input cost must be $2/M");
+    assertEqual(configEntry.cost.output, 6, "Config entry output cost must be $6/M");
+    assertEqual(configEntry.cost.cache_read, 0.2, "Config entry cached-read cost must be $0.20/M");
+    assertEqual(configEntry.cost.cache_write, 0, "Config entry cache-write cost must be $0/M");
+  } finally {
+    delete process.env.OPENCODE_AUTH_CONTENT;
+  }
+  modules.stopProxy();
+
+  // Both request paths accept grok-4.6 and route the id to Cursor's Run API
+  // through the model-agnostic proxy, with no model-specific branch. The child
+  // process loads the proxy with the fixture as its Cursor endpoint.
+  const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  try {
+    fixture.setScenario("clean-end-stream");
+    const routing = await runScenarioSubprocess(fixture.apiUrl, `
+      const { startProxy, stopProxy } = await import("./src/proxy.ts");
+      const port = await startProxy(async () => "test-token");
+      const streamRes = await fetch("http://localhost:" + port + "/v1/chat/completions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "grok-4.6", stream: true, messages: [{ role: "user", content: "route grok-4.6 through streaming" }] }),
+      });
+      const streamBody = await streamRes.text();
+      const nonStreamRes = await fetch("http://localhost:" + port + "/v1/chat/completions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "grok-4.6", stream: false, messages: [{ role: "user", content: "route grok-4.6 through non-streaming" }] }),
+      });
+      const nonStreamBody = await nonStreamRes.json();
+      stopProxy();
+      console.log(JSON.stringify({
+        streamStatus: streamRes.status,
+        streamDone: streamBody.includes("data: [DONE]"),
+        streamEcho: streamBody.includes('"model":"grok-4.6"'),
+        nonStreamStatus: nonStreamRes.status,
+        nonStreamModel: nonStreamBody.model,
+      }));
+      process.exit(0);
+    `);
+    assertEqual(routing.streamStatus, 200, "Streaming path must accept grok-4.6");
+    assertEqual(routing.streamDone, true, "Streaming path must complete for grok-4.6");
+    assertEqual(routing.streamEcho, true, "Streaming chunks must echo the grok-4.6 model id");
+    assertEqual(routing.nonStreamStatus, 200, "Non-streaming path must accept grok-4.6");
+    assertEqual(routing.nonStreamModel, "grok-4.6", "Non-streaming response must echo the grok-4.6 model id");
+
+    const deadline = Date.now() + 500;
+    while (
+      Date.now() < deadline &&
+      fixture.getRunRequestModelIds().filter((id) => id === "grok-4.6").length < 2
+    ) {
+      await Bun.sleep(10);
+    }
+    assertEqual(
+      fixture.getRunRequestModelIds().filter((id) => id === "grok-4.6").length,
+      2,
+      "Both streaming and non-streaming requests must route grok-4.6 to Cursor's Run API",
+    );
+  } finally {
+    await fixture.close();
+  }
+  console.log("[test] Grok 4.6 catalog exposure, cost, and routing OK");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -1235,6 +1368,7 @@ async function main() {
     await testLifecycleDiagnostics(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
+    await testGrok46CatalogAndRouting(modules, backend);
     await Bun.sleep(0);
     assert(!unhandledRejection, `Unhandled rejection escaped the smoke harness: ${String(unhandledRejection)}`);
     console.log("\n✓ All smoke tests passed");

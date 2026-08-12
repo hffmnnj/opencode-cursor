@@ -1,7 +1,8 @@
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
+  AgentClientMessageSchema,
   AgentServerMessageSchema,
   ConversationStateStructureSchema,
   ExecServerMessageSchema,
@@ -74,6 +75,8 @@ export interface FakeCursorServer {
   setScenario: (scenario: CursorScenario) => void;
   assertClean: () => void;
   close: () => Promise<void>;
+  /** Model ids observed on every Run request, in arrival order. */
+  getRunRequestModelIds: () => string[];
   /** Test-only resource accounting hooks for proving cleanup assertions fire. */
   trackChild: (pid: number) => void;
   untrackChild: (pid: number) => void;
@@ -177,6 +180,43 @@ function isScenario(value: string): value is CursorScenario {
 }
 
 /**
+ * Extract the model id from every Run request frame in a Connect-framed
+ * client payload. The proxy sends each Run request as a framed
+ * AgentClientMessage; heartbeats and other client messages are skipped.
+ */
+function decodeRunRequestModelIds(bytes: Buffer): string[] {
+  const ids: string[] = [];
+  let offset = 0;
+  while (offset + 5 <= bytes.length) {
+    const flags = bytes[offset]!;
+    const view = new DataView(
+      bytes.buffer,
+      bytes.byteOffset + offset,
+      bytes.byteLength - offset,
+    );
+    const messageLength = view.getUint32(1, false);
+    const frameEnd = offset + 5 + messageLength;
+    if (frameEnd > bytes.length) break;
+    if ((flags & 0b0000_0010) === 0) {
+      const payload = bytes.subarray(offset + 5, frameEnd);
+      if (payload.length > 0) {
+        try {
+          const decoded = fromBinary(AgentClientMessageSchema, payload);
+          if (decoded.message.case === "runRequest") {
+            const modelId =
+              decoded.message.value.requestedModel?.modelId ??
+              decoded.message.value.modelDetails?.modelId;
+            if (modelId) ids.push(modelId);
+          }
+        } catch {}
+      }
+    }
+    offset = frameEnd;
+  }
+  return ids;
+}
+
+/**
  * A local Connect-over-H2 server with bounded failure sequences. The request header
  * x-fake-cursor-scenario selects a scenario; setScenario supplies the default.
  */
@@ -187,6 +227,7 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
   const streams = new Set<http2.ServerHttp2Stream>();
   const childPids = new Set<number>();
   const bridgeEntries = new Set<string>();
+  const runRequestModelIds: string[] = [];
   let defaultScenario: CursorScenario = "clean-end-stream";
   let toolPauseCount = 0;
 
@@ -206,6 +247,17 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
       stream.end();
       return;
     }
+
+    // Record which model id the proxy routed to Cursor on every Run request.
+    const requestChunks: Buffer[] = [];
+    stream.on("data", (chunk) => requestChunks.push(Buffer.from(chunk)));
+    stream.once("close", () => {
+      if (requestChunks.length > 0) {
+        runRequestModelIds.push(
+          ...decodeRunRequestModelIds(Buffer.concat(requestChunks)),
+        );
+      }
+    });
 
     const requested = String(headers["x-fake-cursor-scenario"] ?? defaultScenario);
     const scenario = isScenario(requested) ? requested : defaultScenario;
@@ -379,6 +431,7 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
   return {
     apiUrl: `http://127.0.0.1:${port}`,
     setScenario(scenario) { defaultScenario = scenario; },
+    getRunRequestModelIds() { return [...runRequestModelIds]; },
     trackChild(pid) { childPids.add(pid); },
     untrackChild(pid) { childPids.delete(pid); },
     trackBridgeEntry(key) { bridgeEntries.add(key); },
