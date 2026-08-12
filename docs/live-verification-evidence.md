@@ -58,8 +58,8 @@ Residual limitations: the CLI requires a qualified variant model id, and this co
 
 ## Final stacked regression gates
 
-**Date:** 2026-08-12  
-**Commit under test:** `89668b75e413fe268f8914ca3b799be7cc89e3c2`  
+**Date:** 2026-08-12
+**Commit under test:** `89668b75e413fe268f8914ca3b799be7cc89e3c2`
 **Evidence class:** final local regression gate on the fully stacked branch
 
 All commands were run unpiped with their exit status captured directly:
