@@ -481,6 +481,69 @@ async function testNonStreamingProtocolErrorsAreStructured() {
   console.log("[test] Non-streaming protocol errors return structured responses");
 }
 
+async function testBridgeInvalidEndStreamHasOneTerminalState() {
+  console.log("[test] Testing delayed bridge protocol-failure terminal ownership...");
+  const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  fixture.setScenario("missing-end-stream");
+  const lpEncode = (data: Uint8Array) => {
+    const frame = Buffer.alloc(4 + data.length);
+    frame.writeUInt32BE(data.length, 0);
+    frame.set(data, 4);
+    return frame;
+  };
+  try {
+    const bridge = Bun.spawn({
+      cmd: ["node", "src/h2-bridge.mjs"],
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        CURSOR_BRIDGE_FAILURE_EXIT_DELAY_MS: "50",
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const config = new TextEncoder().encode(JSON.stringify({
+      accessToken: "test-token",
+      url: fixture.apiUrl,
+      path: "/agent.v1.AgentService/Run",
+      unary: false,
+    }));
+    bridge.stdin.write(lpEncode(config));
+    bridge.stdin.write(lpEncode(new Uint8Array([0])));
+    bridge.stdin.end();
+
+    const [exitCode, stdout] = await Promise.all([
+      bridge.exited,
+      new Response(bridge.stdout).arrayBuffer(),
+    ]);
+    assertEqual(exitCode, 1, "A missing Connect end-stream must retain its failure exit code when delayed");
+
+    const controls: Array<{ session?: string; stream?: string; writable?: boolean }> = [];
+    const bytes = Buffer.from(stdout);
+    for (let offset = 0; offset + 4 <= bytes.length;) {
+      const length = bytes.readUInt32BE(offset);
+      offset += 4;
+      assert(offset + length <= bytes.length, "Bridge stdout framing must remain complete after protocol failure");
+      const payload = bytes.subarray(offset, offset + length);
+      offset += length;
+      if (payload[0] === 1) controls.push(JSON.parse(payload.subarray(1).toString("utf8")));
+    }
+    assertEqual(
+      controls.filter((status) => status.session === "failed" && status.stream === "failed").length,
+      1,
+      "A delayed Connect protocol failure must publish exactly one failed transport state",
+    );
+    assert(
+      !controls.some((status) => status.session === "closed" || status.stream === "closed"),
+      "A delayed Connect protocol failure must not publish a contradictory closed transport state",
+    );
+  } finally {
+    await fixture.close();
+  }
+  console.log("[test] Delayed Connect protocol failure remains failed exactly once without closed status");
+}
+
 async function testNonStreamingCollectionFailureContract() {
   console.log("[test] Testing non-streaming truncation, stalls, and bridge failures...");
   const promptSentinel = "non-streaming-secret-prompt-sentinel";
@@ -1561,6 +1624,7 @@ async function main() {
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
     await testNonStreamingProtocolErrorsAreStructured();
+    await testBridgeInvalidEndStreamHasOneTerminalState();
     await testNonStreamingCollectionFailureContract();
     await testFakeCursorScenarioHarness();
     await testStreamingTermination();

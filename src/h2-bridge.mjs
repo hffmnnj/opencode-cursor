@@ -258,6 +258,7 @@ h2Stream.on("end", () => {
   clearLivenessTimers();
   if (!unary && !sawConnectEndStream) {
     failBridge("ConnectProtocolError");
+    return;
   }
   cleanExit = true;
   writeTransportStatus("closed", "closed", false);
