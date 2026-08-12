@@ -917,11 +917,12 @@ async function testServerMessageClassification(modules: TestModules) {
 async function runScenarioSubprocess(
   apiUrl: string,
   script: string,
+  environment: Record<string, string> = {},
 ): Promise<Record<string, unknown>> {
   const child = Bun.spawn({
     cmd: [process.execPath, "-e", script],
     cwd: process.cwd(),
-    env: { ...process.env, CURSOR_API_URL: apiUrl },
+    env: { ...process.env, CURSOR_API_URL: apiUrl, ...environment },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -938,6 +939,7 @@ async function observeToolResume(
   apiUrl: string,
   scenario: "tool-pause-resume" | "tool-pause-transport-death",
   collision = false,
+  environment: Record<string, string> = {},
 ): Promise<Record<string, unknown>> {
   return runScenarioSubprocess(apiUrl, `
     import { startProxy, stopProxy } from "./src/proxy.ts";
@@ -962,15 +964,17 @@ async function observeToolResume(
       second = await boundedText(await request([{ role: "user", content: opening }]));
       secondCall = JSON.parse(second.text.match(/data: (.+)\\n\\n/)?.[1] ?? "{}").choices?.[0]?.delta?.tool_calls?.[0]?.id;
     }
+    const resumeStartedAt = performance.now();
     const resumed = await boundedText(await request([
       { role: "user", content: opening },
       { role: "assistant", content: null, tool_calls: [{ id: firstCall, type: "function", function: { name: "fixture-tool", arguments: "{}" } }] },
       { role: "tool", tool_call_id: firstCall, content: "result-for-" + firstCall },
     ]));
+    const resumeElapsedMs = performance.now() - resumeStartedAt;
     stopProxy();
-    console.log(JSON.stringify({ first, firstCall, second, secondCall, resumed }));
+    console.log(JSON.stringify({ first, firstCall, second, secondCall, resumed, resumeElapsedMs }));
     process.exit(0);
-  `);
+  `, environment);
 }
 
 async function observeStalledRefresh(): Promise<Record<string, unknown>> {
@@ -1048,16 +1052,25 @@ async function testResumeRefreshAndNonStreaming(modules: TestModules) {
     console.log("[test] Identical-opening conversations retain isolated paused bridges");
 
     fixture.setScenario("tool-pause-transport-death");
-    const droppedWrite = await observeToolResume(fixture.apiUrl, "tool-pause-transport-death");
+    const droppedWrite = await observeToolResume(
+      fixture.apiUrl,
+      "tool-pause-transport-death",
+      false,
+      { CURSOR_BRIDGE_FAILURE_EXIT_DELAY_MS: "100" },
+    );
+    const elapsedMs = Number(droppedWrite.resumeElapsedMs);
+    const droppedWriteBody = String((droppedWrite.resumed as { text?: string }).text ?? "");
     assert(
-      String((droppedWrite.resumed as { text?: string }).text ?? "").includes('"finish_reason":"tool_calls"'),
-      "A closed transport must not accept a dropped resume write as a live bridge",
+      !Boolean((droppedWrite.resumed as { timedOut?: boolean }).timedOut) && elapsedMs < 150,
+      "A process-alive, transport-dead resume must terminate before the bounded observation window",
     );
     assert(
-      !String((droppedWrite.resumed as { text?: string }).text ?? "").includes("resumed-correctly"),
-      "A dead bridge must reject its pending result rather than accepting a stale write",
+      droppedWriteBody.includes("[Error: Cursor bridge transport is unavailable for tool resume]"),
+      "A process-alive dead transport must report the sanitized resume error",
     );
-    console.log("[test] Closed-stream bridge rejects stale writes and resumes through a fresh request");
+    assertEqual(doneCount(droppedWriteBody), 1, "A process-alive dead transport resume must emit exactly one [DONE]");
+    assert(!droppedWriteBody.includes("resumed-correctly"), "A dead transport must never accept a stale resume write");
+    console.log(`[test] Process-alive dead transport resume errors explicitly once in ${Math.round(elapsedMs)}ms`);
 
     fixture.setScenario("tool-pause-clean-exit");
     const port = await modules.startProxy(async () => "test-token");
