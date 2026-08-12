@@ -64,6 +64,16 @@ const FALLBACK_MODELS: CursorModel[] = [
 ];
 
 /**
+ * Known catalog metadata keyed by id. The GetUsableModels protobuf carries
+ * no limit fields, so live-discovered models reuse these context/max-token
+ * (and, when discovery omits them, display/reasoning) values while keeping
+ * discovery fields such as displayName and thinkingDetails authoritative.
+ */
+const FALLBACK_MODEL_BY_ID = new Map(
+  FALLBACK_MODELS.map((model) => [model.id, model] as const),
+);
+
+/**
  * Pseudo-model for Cursor's server-side Auto routing. Always exposed
  * alongside discovered models; the proxy maps it to Run modelId "default".
  */
@@ -185,12 +195,19 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
   const id = details.modelId.trim();
   if (!id) return null;
 
+  const known = FALLBACK_MODEL_BY_ID.get(id);
+  const hasThinkingDetails = details.thinkingDetails !== undefined;
+
   return {
     id,
-    name: pickDisplayName(details, id),
-    reasoning: Boolean(details.thinkingDetails),
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
+    name: pickDisplayName(details, known?.name ?? id),
+    // Discovery fields win when present; known fallback metadata fills the
+    // gaps left by the limit-less GetUsableModels protobuf.
+    reasoning: hasThinkingDetails
+      ? Boolean(details.thinkingDetails)
+      : (known?.reasoning ?? false),
+    contextWindow: known?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+    maxTokens: known?.maxTokens ?? DEFAULT_MAX_TOKENS,
   };
 }
 

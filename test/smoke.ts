@@ -14,6 +14,7 @@ import {
   KvServerMessageSchema,
   ModelDetailsSchema,
   TextDeltaUpdateSchema,
+  ThinkingDetailsSchema,
   TurnEndedUpdateSchema,
 } from "../src/proto/agent_pb";
 import {
@@ -188,6 +189,12 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
                       displayName: model.name,
                       displayNameShort: model.name,
                       aliases: [],
+                      // The protobuf only expresses thinking support by
+                      // presence, so a truthy reasoning flag emits a
+                      // thinkingDetails object; false/absent leaves it out.
+                      ...(model.reasoning
+                        ? { thinkingDetails: create(ThinkingDetailsSchema, {}) }
+                        : {}),
                     }),
                   ),
                 }),
@@ -1228,6 +1235,45 @@ async function testGrok46CatalogAndRouting(
   assert(grokCodeFast, "Fallback discovery must keep grok-code-fast-1");
   assertEqual(grokCodeFast.reasoning, false, "grok-code-fast-1 must stay non-reasoning");
   assertEqual(grokCodeFast.contextWindow, 128_000, "grok-code-fast-1 must keep its 128K context");
+
+  // Live discovery normalizes known models to their fallback limits: the
+  // GetUsableModels protobuf carries no limit fields, so a live grok-4.6 must
+  // still report the Cursor-facing 256K/64K with reasoning true, while the
+  // discovery display name stays authoritative. Unknown models keep generic
+  // defaults.
+  modules.clearModelCache();
+  backend.setDiscoveryMode("success");
+  backend.setDiscoveredModels([
+    { id: "grok-4.6", name: "Grok 4.6" },
+    { id: "unknown-live-model", name: "Unknown Live Model" },
+  ]);
+  const live = await modules.getCursorModels("test-token");
+  const liveGrok46 = live.find((model) => model.id === "grok-4.6");
+  assert(liveGrok46, "Live discovery must expose grok-4.6");
+  assertEqual(liveGrok46.name, "Grok 4.6", "Live grok-4.6 must use the discovery display name");
+  assertEqual(liveGrok46.reasoning, true, "Live grok-4.6 must reuse fallback reasoning when discovery omits thinking details");
+  assertEqual(liveGrok46.contextWindow, 256_000, "Live grok-4.6 must normalize to the Cursor-facing 256K context");
+  assertEqual(liveGrok46.maxTokens, 64_000, "Live grok-4.6 must normalize to 64K max tokens");
+  const unknownLive = live.find((model) => model.id === "unknown-live-model");
+  assert(unknownLive, "Live discovery must expose the unknown model");
+  assertEqual(unknownLive.name, "Unknown Live Model", "Unknown live model keeps its discovery display name");
+  assertEqual(unknownLive.reasoning, false, "Unknown live model keeps the generic non-reasoning default");
+  assertEqual(unknownLive.contextWindow, 200_000, "Unknown live model keeps the generic 200K context default");
+  assertEqual(unknownLive.maxTokens, 64_000, "Unknown live model keeps the generic 64K max-tokens default");
+
+  // Discovery fields stay authoritative where present: thinkingDetails emitted
+  // by Cursor overrides the fallback reasoning flag, while known limits still
+  // normalize from fallback metadata.
+  modules.clearModelCache();
+  backend.setDiscoveredModels([
+    { id: "grok-code-fast-1", name: "Grok Code Fast 1", reasoning: true },
+  ]);
+  const authoritative = await modules.getCursorModels("test-token");
+  const authoritativeGcf = authoritative.find((model) => model.id === "grok-code-fast-1");
+  assert(authoritativeGcf, "Live discovery must expose grok-code-fast-1");
+  assertEqual(authoritativeGcf.reasoning, true, "Discovery thinkingDetails must override fallback reasoning");
+  assertEqual(authoritativeGcf.contextWindow, 128_000, "Known limits must still normalize from fallback metadata");
+  assertEqual(authoritativeGcf.maxTokens, 64_000, "Known max tokens must still normalize from fallback metadata");
 
   // The v2 catalog hook (auth.loader -> provider.models) emits a complete
   // Grok 4.6 entry: limits, reasoning flag, explicit cost, text-only caps.
