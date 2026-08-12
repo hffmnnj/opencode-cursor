@@ -1202,6 +1202,7 @@ export function processServerMessage(
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
   onProtocolError?: (error: Error) => void,
+  onTurnEnded?: () => void,
 ): void {
   const markSemanticProgress = () => {
     state.semanticProgressCount += 1;
@@ -1210,7 +1211,7 @@ export function processServerMessage(
 
   switch (msg.message.case) {
     case "interactionUpdate":
-      handleInteractionUpdate(msg.message.value, state, onText, markSemanticProgress);
+      handleInteractionUpdate(msg.message.value, state, onText, markSemanticProgress, onTurnEnded);
       return;
     case "kvServerMessage":
       handleKvMessage(msg.message.value, blobStore, sendFrame);
@@ -1253,6 +1254,7 @@ function handleInteractionUpdate(
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
   markSemanticProgress: () => void,
+  onTurnEnded?: () => void,
 ): void {
   switch (update.message.case) {
     case "textDelta": {
@@ -1291,9 +1293,13 @@ function handleInteractionUpdate(
     case "shellOutputDelta":
     case "stepStarted":
     case "stepCompleted":
-    // Cursor's turnEnded sequencing is unproven, so only a Connect end-stream may terminate.
     case "heartbeat":
+      return;
+    // Cursor emits this after normal completion and can leave its HTTP/2 stream
+    // open without a Connect end-stream. The response owner supplies an
+    // idempotent terminal callback so a later transport close stays inert.
     case "turnEnded":
+      onTurnEnded?.();
       return;
     case undefined:
       return;
@@ -1665,6 +1671,13 @@ function createBridgeStreamResponse(
         lastSemanticProgressAt: Date.now(),
       };
       const tagFilter = createThinkingTagFilter();
+      const persistLiveConversation = () => {
+        const stored = conversationStates.get(convKey);
+        if (!stored) return;
+        for (const [k, v] of blobStore) stored.blobStore.set(k, v);
+        stored.lastAccessMs = Date.now();
+        persistConversation(convKey, stored);
+      };
 
       let mcpExecReceived = false;
       let connectEndStreamReceived = false;
@@ -1676,6 +1689,7 @@ function createBridgeStreamResponse(
         terminal = true;
         semanticWatchdog.clear();
         clearInterval(heartbeatTimer);
+        persistLiveConversation();
         for (const active of activeBridges.values()) {
           if (active.bridge === bridge) removeActiveBridge(active);
         }
@@ -1787,16 +1801,14 @@ function createBridgeStreamResponse(
                 const stored = conversationStates.get(convKey);
                 if (stored) {
                   stored.checkpoint = checkpointBytes;
-                  // Merge live blobs before persisting: the checkpoint may
-                  // reference blobs set during this stream.
-                  for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-                  stored.lastAccessMs = Date.now();
-                  persistConversation(convKey, stored);
+                  // The checkpoint may reference blobs set during this stream.
+                  persistLiveConversation();
                 }
               },
               finishTerminal,
+              () => finishTerminal(),
             );
-            semanticWatchdog.observe();
+            if (!terminal) semanticWatchdog.observe();
             emitLifecycleDiagnostic("proxy", "message_dispatch", {
               messageCase: serverMessage.message.case,
               interactionCase: serverMessage.message.case === "interactionUpdate"
@@ -1835,12 +1847,7 @@ function createBridgeStreamResponse(
         emitLifecycleDiagnostic("proxy", "terminal", { exitCode: code });
         semanticWatchdog.clear();
         clearInterval(heartbeatTimer);
-        const stored = conversationStates.get(convKey);
-        if (stored) {
-          for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-          stored.lastAccessMs = Date.now();
-          persistConversation(convKey, stored);
-        }
+        persistLiveConversation();
         if (terminal) return;
         if (mcpExecReceived) {
           // Tool pause deliberately owns neither terminal cleanup nor bridge
@@ -2105,8 +2112,9 @@ async function collectFullResponse(
           (error) => {
             finishCollection(error);
           },
+          () => finishCollection(),
         );
-        semanticWatchdog.observe();
+        if (!settled) semanticWatchdog.observe();
       } catch (error) {
         // A complete Connect frame with an invalid protobuf payload cannot be
         // safely ignored in unary mode either: it may contain the only

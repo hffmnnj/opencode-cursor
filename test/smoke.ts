@@ -548,6 +548,10 @@ function doneCount(body: string): number {
   return body.split("data: [DONE]").length - 1;
 }
 
+function errorCount(body: string): number {
+  return body.split("[Error:").length - 1;
+}
+
 async function observeProxyScenario(
   scenario: CursorScenario,
   deadlineMs = 125,
@@ -643,6 +647,7 @@ async function testStreamingTermination() {
   const terminalLessClose = await observeProxyScenario("transport-close-without-terminal");
   assert(terminalLessClose.body.includes("before-terminal-less-close"), "Terminal-less closure must preserve preceding text");
   assert(terminalLessClose.body.includes("[Error:"), "Closure without turnEnded or Connect end-stream must be surfaced as an error");
+  assertEqual(errorCount(terminalLessClose.body), 1, "Closure without a terminal signal must emit exactly one explicit error");
   assertEqual(doneCount(terminalLessClose.body), 1, "Closure without a terminal signal must emit exactly one [DONE]");
   console.log("[test] Terminal-less transport closure reaches finishTerminal as an explicit error exactly once");
 
@@ -694,17 +699,21 @@ async function testStreamingTermination() {
     CURSOR_BRIDGE_SESSION_TIMEOUT_MS: "1000",
     CURSOR_BRIDGE_PING_INTERVAL_MS: "1000",
   });
-  assert(!turnEndedStall.timedOut, "turnEnded without Connect end-stream must be bounded by the semantic watchdog");
+  assert(!turnEndedStall.timedOut, "turnEnded without Connect end-stream must terminate promptly");
   assert(turnEndedStall.body.includes("before-turn-ended-stall"), "turnEnded stall fixture must deliver the preceding text delta");
-  assert(turnEndedStall.body.includes("[Error: Cursor response stalled waiting for semantic progress]"), "Current turnEnded no-op must not terminate before the test-controlled semantic watchdog");
-  assertEqual(doneCount(turnEndedStall.body), 1, "Semantic watchdog termination after turnEnded must emit exactly one [DONE]");
-  console.log("[test] turnEnded is currently a no-op; only the semantic watchdog reaches finishTerminal");
+  assertEqual(errorCount(turnEndedStall.body), 0, "turnEnded must complete cleanly before the semantic watchdog");
+  assert(turnEndedStall.body.includes('"finish_reason":"stop"'), "turnEnded must emit a stop terminal chunk");
+  assert(turnEndedStall.body.includes('"usage":'), "turnEnded must emit a usage terminal chunk");
+  assertEqual(doneCount(turnEndedStall.body), 1, "turnEnded must emit exactly one [DONE]");
+  console.log("[test] turnEnded completes the open response before the semantic watchdog");
 
   const turnEndedClose = await observeProxyScenario("turn-ended-transport-close");
   assert(turnEndedClose.body.includes("before-turn-ended-close"), "turnEnded transport-close fixture must deliver the preceding text delta");
-  assert(turnEndedClose.body.includes("[Error:"), "Current turnEnded no-op must defer terminal ownership to the close cascade");
+  assertEqual(errorCount(turnEndedClose.body), 0, "Transport closure after turnEnded must stay clean and idempotent");
+  assert(turnEndedClose.body.includes('"finish_reason":"stop"'), "turnEnded transport-close must emit a stop terminal chunk");
+  assert(turnEndedClose.body.includes('"usage":'), "turnEnded transport-close must emit a usage terminal chunk");
   assertEqual(doneCount(turnEndedClose.body), 1, "turnEnded followed by transport closure must emit exactly one [DONE]");
-  console.log("[test] turnEnded followed by transport closure reaches finishTerminal as an explicit error exactly once");
+  console.log("[test] turnEnded followed by transport closure remains clean exactly once");
 
   const slowProgress = await observeProxyScenario("slow-semantic-progress", 500);
   assert(!slowProgress.timedOut, "Slow semantic progress exceeded its bounded completion window");

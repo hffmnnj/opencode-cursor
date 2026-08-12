@@ -401,13 +401,15 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
         ]));
         break;
       case "turn-ended-transport-close":
-        // The present no-op for turnEnded defers termination to the transport
-        // close cascade rather than treating this as a clean completion.
+        // A close after Cursor's completion signal must not change the already
+        // clean terminal outcome. Retain the session before the proxy releases
+        // the bridge so this scenario can still deliver the late close.
+        const session = stream.session;
         stream.write(Buffer.concat([
           frameConnectMessage(textDelta("before-turn-ended-close")),
           frameConnectMessage(turnEnded()),
         ]));
-        setTimeout(() => stream.session.destroy(), 10);
+        setTimeout(() => session.destroy(), 10);
         break;
       case "checkpoint-trickle":
         trickle(checkpoint());
