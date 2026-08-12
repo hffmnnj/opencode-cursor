@@ -55,3 +55,27 @@ The captured artifacts were inspected only for structure and marker presence. Sa
 ## Reproduction requirement
 
 Residual limitations: the CLI requires a qualified variant model id, and this conclusive run tested the high variant rather than the bare catalog id. The idle case intentionally did not induce a provider stall. The A1/A7 conclusions are direct observations of one authenticated normal completion; broader variant and failure-path coverage remains outside this rerun. No product change is justified by these observations.
+
+## Final stacked regression gates
+
+**Date:** 2026-08-12  
+**Commit under test:** `89668b75e413fe268f8914ca3b799be7cc89e3c2`  
+**Evidence class:** final local regression gate on the fully stacked branch
+
+All commands were run unpiped with their exit status captured directly:
+
+| Gate | Exact command | Exit | Result |
+|---|---|---:|---|
+| Typecheck | `npx tsc -p tsconfig.json --noEmit` | 0 | PASS; no TypeScript errors |
+| Full smoke | `bun test/smoke.ts` | 0 | PASS; `✓ All smoke tests passed` |
+| Build | `bun run build` | 0 | PASS; `tsc -p tsconfig.json && node scripts/copy-runtime.mjs` |
+
+Static/runtime count evidence: `test/smoke.ts` contains **185 assertion call sites**, **17 test functions**, and runtime reports **28 selectable fake Cursor scenarios**. All inherited stability cases and Grok 4.6 catalog/routing cases passed. No quarantines or known-failure markers appeared in the current smoke source/output.
+
+The smoke suite writes conversation cache data under `~/.cache/opencode-cursor`; this cache location is expected and was not committed.
+
+## Package script inspection and no-regression finding
+
+`package.json` was inspected directly. Scripts present are `build`, `test`, and `prepublishOnly`. There is **no `lint` script** and **no root `typecheck` script**; the explicit TypeScript command above is the repository's typecheck entry point. No lint command was silently skipped.
+
+Existing model behavior remains unchanged alongside Grok 4.6. Smoke confirms `grok-code-fast-1` retains its prior 128K context and non-reasoning metadata, while Grok 4.6 exposes 256K context, reasoning enabled, and 64K output metadata with explicit $2/$0.50 cached/$6 pricing. Both streaming and non-streaming Grok 4.6 routing assertions pass. **No regression found in existing model metadata or cost behavior.**
