@@ -1,11 +1,11 @@
 # Cursor Model Hang — Root Cause Analysis
 
-Status: **Evidence baseline, lifecycle map, and terminal-contract runtime evidence complete.** This
-document opens the hang investigation: it preserves the speculative uncommitted overlay that
-predated this investigation, classifies every hunk with an explicit disposition, records
-baseline-vs-overlay behavior, and then (Part 2) enumerates every open-SSE path and termination
-route with source-linked matrices. No behavioral fix is implemented here; the matrices exist
-so the termination-contract work lands directly against a complete map.
+Status: **Root cause settled, termination contract shipped and live-verified.** This document
+preserves the speculative uncommitted overlay that predated this investigation, classifies every
+hunk with an explicit disposition, records baseline-vs-overlay behavior, and (Part 2) enumerates
+every open-SSE path and termination route with source-linked matrices. Part 3 closes the
+investigation: the settled root cause, the shipped termination contract, and the isolated live
+verification that confirmed the two previously runtime-deferred assumptions (A1 and A7).
 
 ## Grounding fact: nothing upstream rescues a stuck request
 
@@ -155,15 +155,25 @@ records carry the same ID and include the parent elapsed time at spawn for cross
 
 The stage inventory is: `auth_access_start`, `auth_access_complete`, refresh start/complete/fail,
 `proxy_entry`, `bridge_spawn`, `bridge_start`, `h2_connect`, `connect_stream`, first
-`bridge_data`, first `connect_frame`, `end_stream`, `message_dispatch`, `tool_pause`,
-`tool_resume`, first `sse_emission`, and `terminal`. Conditional tool stages appear only for
-tool-call requests. Bridge timeout kills are distinguishable: `terminal` with
-`errorName: "Timeout:connect"` (initial 30s connect bound) or `"Timeout:idle"` (120s activity
+`bridge_data`, first `connect_frame`, `message_dispatch`, `outbound_model`, `tool_pause`,
+`tool_resume`, first `sse_emission`, `end_stream`, `turn_ended`, and `terminal`. Conditional tool
+stages appear only for tool-call requests. Bridge timeout kills are distinguishable: `terminal`
+with `errorName: "Timeout:connect"` (initial 30s connect bound) or `"Timeout:idle"` (120s activity
 bound) versus `errorName` from a client/stream error and `exitCode` from normal exit. See
 Part 2 §2.8 for the instrumentation added in this pass.
 
+Two stages exist specifically to answer the live-verification questions:
+
+- `outbound_model` carries `modelId` — the exact Cursor wire model id the Run request sends
+  (after the `auto` → `default` mapping). This is the single request-derived field admitted to
+  diagnostics, and it is how live evidence confirmed the Cursor-facing id.
+- `turn_ended` carries `transportState` and `writable` — the parent-observed bridge transport
+  state captured *before* terminal cleanup tears the bridge down, proving whether Cursor ended a
+  turn while its HTTP/2 transport remained usable.
+
 Diagnostics use a strict allowlist: source, stage, request ID, elapsed time, byte length, message
-case, interaction case, tool count, status/exit code, and error class. They never serialize auth
+case, interaction case, tool count, status/exit code, error class, the outbound `modelId`, and the
+`turn_ended` transport fields (`transportState`, `writable`). They never serialize auth
 tokens or headers, cookies, prompt/message text, tool arguments/results, or blob/checkpoint IDs.
 The parent always drains child stderr even while diagnostics are disabled, preventing pipe
 backpressure from stalling the bridge.
@@ -450,9 +460,11 @@ proxy and child records can be ordered across the process boundary.
 | `terminal` with `exitCode: 0` after `end_stream` | the normal clean cascade (T1→T4) |
 
 **Emitted-only-allowlist reminder:** stages, request ID, elapsed time, byte lengths, message
-case names, tool counts, status/exit codes, and error class names. Tokens, authorization
-headers, prompt text, tool arguments/results, and blob/checkpoint IDs are never serialized
-(`src/auth.ts:48-67`; parent drain filter `src/proxy.ts:344-365`).
+case names, tool counts, status/exit codes, error class names, the outbound wire `modelId`
+(`outbound_model`), and the parent-observed transport fields `transportState`/`writable`
+(`turn_ended`). Tokens, authorization headers, prompt text, tool arguments/results, and
+blob/checkpoint IDs are never serialized (`src/auth.ts:66-88`; parent drain filter
+`src/proxy.ts:365-409`).
 
 ## 2.10 Runtime reproduction verdicts
 
@@ -519,8 +531,77 @@ bridge H2 stream is closed makes the child exit non-zero rather than being silen
 | Empty Connect end-stream is an error | **Refuted after fix** | The zero-byte fixture completes cleanly with exactly one `[DONE]`. |
 | Missing end-stream / abrupt H2 close becomes clean success or retry fodder | **Confirmed before fix; closed** | Missing-end, stream-reset, and abrupt-session-close fixtures now emit one explicit error and one `[DONE]`; no empty success is observed. This closes the local boundary implicated by issue #33. |
 | Malformed Connect terminal or protobuf message is silently lost | **Confirmed before fix; closed** | Partial/malformed terminal and malformed protobuf fixtures each reach one explicit error terminal. |
-| Bridge write failure is silently dropped | **Confirmed by source; propagation covered** | A rejected KV response write propagates out of dispatch into the terminal path; the bridge also exits non-zero when stdin reaches a closed H2 stream. The process-alive, transport-dead resume race remains deferred to the resume-liveness work. |
+| Bridge write failure is silently dropped | **Confirmed by source; propagation covered** | A rejected KV response write propagates out of dispatch into the terminal path; the bridge also exits non-zero when stdin reaches a closed H2 stream. **Closed in Wave 4 (`64edca6`):** a paused resume now requires a child-reported writable transport and fails explicitly in bounded time instead of dropping the write silently (Part 3 §3.2). |
 | Tool-result pause must retain a live bridge | **Confirmed and preserved** | The healthy tool-resume fixture still returns `resumed-correctly`; pause is not terminal cleanup. |
 | Heartbeat/checkpoint traffic can stand in for semantic progress | **Confirmed before classification; not a terminal-contract result** | Fixtures classify heartbeat/turn-ended traffic as non-progress and report transport closure explicitly. Stall detection itself remains separate work. |
-| Unbounded refresh and non-streaming collection | **Confirmed and deferred** | Their quarantined bounded observations still show no headers at 125ms; no timeout, watchdog, or deadline was added here. |
-| Bridge-key collision | **Confirmed and deferred** | The quarantined same-opening-conversation assertion still reproduces cross-routing; key derivation was not changed. |
+| Unbounded refresh and non-streaming collection | **Confirmed and deferred** | Their quarantined bounded observations still show no headers at 125ms; no timeout, watchdog, or deadline was added here. **Closed in later waves:** refresh is bounded by `CURSOR_REFRESH_TIMEOUT_MS` (15s default / 60s cap → sanitized 504 `token_refresh_timeout`) and non-streaming collection by the semantic watchdog (504 `response_stall_timeout`); defaults are documented in README and Part 3 §3.2. |
+| Bridge-key collision | **Confirmed and deferred** | The quarantined same-opening-conversation assertion still reproduces cross-routing; key derivation was not changed. **Closed in Wave 4:** resume identity is now an opaque per-pause UUID plus Cursor tool-call ids — never content-derived — so identical-opening conversations stay isolated (promoted smoke assertions; Part 3 §3.2). |
+
+---
+
+# Part 3 — Settled root cause, termination contract, and live closure
+
+This part closes the investigation. It states the settled root cause, records the termination
+contract exactly as shipped, and attaches the isolated live evidence that resolved the two
+previously runtime-deferred assumptions (A1 and A7). Deterministic fixture evidence and live
+observation are deliberately kept distinct throughout.
+
+## 3.1 Settled root cause
+
+The indefinite thinking/typing stall was a **termination gap on the normal completion path**,
+not a missing timeout. Cursor can signal a finished turn with `InteractionUpdate.turnEnded`
+while leaving its HTTP/2 stream open — no Connect end-stream follows. The inherited proxy
+treated `turnEnded` as non-terminal, so a completed turn produced no SSE terminal of its own;
+the only bound left was the semantic-progress watchdog, which (correctly) does not count
+heartbeat/checkpoint traffic as progress and therefore waits out a long, quiet post-turn window.
+Combined with a raw-byte idle timer that every inbound frame and the proxy's own 5s heartbeat
+defeated, a normal completion could sit open until OpenCode or the user intervened.
+
+Two contributing gaps were closed in earlier passes and are part of the settled contract:
+silent truncation (a non-zero bridge exit or an abrupt H2 close could surface as a clean
+`finish_reason: "stop"`), and bridge reuse that keyed on process aliveness alone, so a
+process-alive but transport-dead paused bridge accepted a resume write that vanished silently.
+
+## 3.2 The termination contract as shipped
+
+Every request reaches exactly one terminal outcome through one idempotent owner
+(`finishTerminal` in the streaming path, `finishCollection` in the non-streaming path).
+
+| Signal | Behavior |
+|---|---|
+| `turnEnded` | **Normal completion.** Closes cleanly with `finish_reason: "stop"`, usage, and exactly one `[DONE]` even though the HTTP/2 stream may remain open. A later transport close cannot double-report. |
+| Connect end-stream, no error (including zero-byte) | Clean completion through the same owner; exactly one `[DONE]`. |
+| Connect end-stream with `error` | Error content, `stop`, usage, one `[DONE]`; exactly one explicit error. |
+| Closure without `turnEnded` and without a Connect end-stream | **Terminal-less closure error** — exactly one explicit error and one `[DONE]`, regardless of bridge exit code. Never a clean `finish_reason: "stop"` without a completion signal. |
+| Semantic-progress watchdog | **Abnormal-path bound only.** Counts only semantic progress (text, thinking, positive token deltas, exec transitions); heartbeat, checkpoint, KV, and interaction-query traffic never defer it. Normal completion terminates on its protocol signal, never on watchdog expiry. Slow-but-progressing streams are preserved (fixture `slow-semantic-progress`). |
+| Transport-aware resume | A paused bridge resumes only when the child reports a writable HTTP/2 transport (`transportState: "writable"`). A process-alive but transport-dead bridge fails explicitly with the sanitized error `Cursor bridge transport is unavailable for tool resume`, exactly one `[DONE]`, in bounded time. A fully exited bridge falls back to a fresh request rebuilt from checkpoint/blob/tool history. Resume identity is an opaque per-pause UUID plus Cursor's tool-call ids — never derived from message content — so identical-opening conversations cannot cross-route results. |
+| Safe query refusal | Generated interaction queries with a refusal arm (web search, ask-question, switch-mode, Exa search/fetch, plan) receive typed rejections and the same turn continues to a clean `turnEnded`. `setupVmEnvironmentArgs` and `execServerControlMessage` remain explicit errors because no safe refusal arm exists. |
+
+## 3.3 Live closure (A1 and A7) and the idle case
+
+The isolated tmux live run (`docs/live-verification-evidence.md`, commits `29c6d6d`/`89668b7`)
+resolved both previously runtime-deferred assumptions for the tested normal completion:
+
+- **A1 — Cursor-facing wire id: confirmed for the tested variant.** OpenCode's model name
+  `cursor/cursor-grok-4.6-high` is sent to the Run API as the wire id `cursor-grok-4.6-high`
+  (observed via the sanitized `outbound_model modelId=cursor-grok-4.6-high` record). The bare
+  `grok-4.6` fallback catalog id remains the resilience path, not a live wire id.
+- **A7 — `turnEnded` while H2 writable: confirmed.** The sanitized record
+  `turn_ended transportState=writable writable=true elapsedMs=2372` followed by
+  `terminal elapsedMs=2373` proves Cursor ended the turn at 2372ms while the transport was
+  still writable, immediately before terminal cleanup. The strict Wave 3 contract was retained.
+
+**Live idle case did not induce a provider stall.** The deliberate-idle run (a non-destructive
+idle prompt, 10.214s wall-clock) completed without forcing a provider stall, so it is recorded
+as live pass with limitation rather than as stall evidence. Stall bounding remains
+deterministically demonstrated by fixture evidence only (`heartbeat-trickle-kept-open` →
+explicit `response_stall_timeout`; `turn-ended-semantic-stall` → prompt clean terminal before
+watchdog). Live and fixture evidence are never mixed.
+
+## 3.4 Diagnostics additions that closed the loop
+
+`outbound_model` (wire `modelId`) and `turn_ended` (`transportState`, `writable`) are the two
+allowlisted fields that made A1/A7 observable without exposing any payload. The full
+sanitization boundary is stated in the "Safe lifecycle diagnostics" section above and asserted
+in `test/smoke.ts:testLifecycleDiagnostics` (schema, allowlist, disabled silence, secret
+redaction).

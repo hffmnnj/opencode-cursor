@@ -38,18 +38,23 @@ OpenAI-compatible proxy on demand and routes requests through Cursor's gRPC API.
 
 ## Models
 
-Grok 4.6 is supported. The plugin registers it as `grok-4.6` in the fallback
-model catalog, and live discovery returns whatever models Cursor serves.
+Grok 4.6 is supported on two surfaces that stay consistent:
 
-- Default context: 256K tokens (Cursor-facing default)
-- Reasoning: supported — Cursor lists Grok 4.6 with Agent + Thinking
-- Short-context pricing: $2 input / $6 output per million tokens
+- **Fallback catalog id `grok-4.6`** — the plugin's resilience path when live
+  discovery is unavailable. It carries the Cursor-facing metadata: 256K default
+  context, reasoning enabled (Cursor lists Grok 4.6 with Agent + Thinking), and
+  64K max output.
+- **Live-discovered variants** — `GetUsableModels` is authoritative and returns
+  whatever Cursor serves, typically qualified variant ids. Live-verified:
+  OpenCode's model name `cursor/cursor-grok-4.6-high` is sent to Cursor's Run
+  API as the wire id `cursor-grok-4.6-high`. The bare `grok-4.6` id remains the
+  fallback catalog entry.
 
-The plugin proxies Cursor's Connect API, so model metadata mirrors Cursor's
-published surface. The xAI direct API advertises a 500K window and accepts
-image input; neither applies to this plugin, which is text-in / text-out for
-every model. Image and vision input are never forwarded, so Grok 4.6 is
-text-only here.
+Cursor-facing short-context pricing is **$2 input / $6 output per million
+tokens**, with a **$0.50 cached-read** rate. The xAI direct API advertises a
+500K window and accepts image input; neither applies to this plugin, which is
+text-in / text-out for every model. Image and vision input are never forwarded,
+so Grok 4.6 is text-only here.
 
 ## How it works
 
@@ -99,6 +104,45 @@ Conversation history is rebuilt from the OpenAI messages on every request
 checkpoints are persisted to `~/.cache/opencode-cursor/conversations/` so
 context survives restarts. Set `CURSOR_PROXY_DEBUG=1` to log the KV blob
 handshake and exec traffic when debugging.
+
+## Configuration and timeouts
+
+All defaults work out of the box; **no configuration is required.** Every
+timeout below is read by the code path that enforces it and has a hard cap, so
+an invalid environment value can never disable the guard.
+
+### Diagnostics and logging
+
+| Variable | Default | Behavior |
+|---|---|---|
+| `CURSOR_PROXY_DIAGNOSTICS` | off | `1` emits one-line JSON lifecycle records to stderr: `auth_access_start/complete`, `auth_refresh_start/complete/failed`, `proxy_entry`, `bridge_spawn`, `bridge_start`, `h2_connect`, `connect_stream`, `bridge_data`, `connect_frame`, `message_dispatch`, `outbound_model`, `tool_pause`, `tool_resume`, `sse_emission`, `end_stream`, `turn_ended`, and `terminal`. Fields are allowlisted — stage names, elapsed times, byte lengths, status/exit codes, error class names, the outbound Cursor wire `modelId`, and parent-observed transport state (`transportState`, `writable`). Tokens, authorization headers, cookies, prompt text, tool payloads, and blob/checkpoint IDs are never serialized. |
+| `CURSOR_PROXY_DEBUG` | off | Verbose KV-blob, exec-redirect, and end-stream debug lines on stderr. |
+
+### Timeouts
+
+| Variable | Default | Cap | Bounds |
+|---|---|---|---|
+| `CURSOR_REFRESH_TIMEOUT_MS` | 15 000 (15s) | 60 000 (60s) | Token refresh fetch; a stall returns a sanitized `token_refresh_timeout` 504. |
+| `CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS` | 900 000 (15 min) | 3 600 000 (60 min) | Wait for the first semantic progress (text, thinking, positive token delta, or exec transition). |
+| `CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS` | 600 000 (10 min) | 1 800 000 (30 min) | Max silence between semantic progress events. Heartbeat, checkpoint, and query traffic never defer it; slow-but-progressing streams are preserved. |
+| `CURSOR_BRIDGE_PING_INTERVAL_MS` | 15 000 (15s) | 300 000 (5 min) | HTTP/2 PING cadence that validates the transport path. |
+| `CURSOR_BRIDGE_PING_TIMEOUT_MS` | 10 000 (10s) | 60 000 (60s) | PING response window; a miss fails the session explicitly. |
+| `CURSOR_BRIDGE_SESSION_TIMEOUT_MS` | 120 000 (2 min) | 600 000 (10 min) | HTTP/2 session inactivity bound; expiry fails the session explicitly. |
+| `CURSOR_BRIDGE_FAILURE_EXIT_DELAY_MS` | 0 | 1 000 (1s) | **Internal test seam — not recommended for configuration.** Briefly retains a failed bridge child so tests can exercise parent-side handling of a process-alive, transport-dead resume. Leave unset. |
+
+Fixed transport constants (not environment-tunable): the initial Connect bound
+is 30s, the bridge activity/idle bound is 120s, the proxy writes a client
+heartbeat every 5s, and unary discovery RPCs time out after 5s.
+
+### Endpoint and path overrides
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CURSOR_API_URL` | `https://api2.cursor.sh` | Connect endpoint override, read once at module load. The smoke harness uses it to point at the fake Cursor backend. |
+| `CURSOR_REFRESH_URL` | `https://api2.cursor.sh/auth/exchange_user_api_key` | Token refresh endpoint override, read once at module load. Test harness seam. |
+| `XDG_CACHE_HOME` | `~/.cache` | Base for the `opencode-cursor/conversations` disk cache. |
+| `XDG_DATA_HOME` | `~/.local/share` | Base for the `opencode/auth.json` credential lookup. |
+| `OPENCODE_AUTH_CONTENT` | — | Replaces on-disk `auth.json` contents; testing seam. |
 
 ## Develop locally
 
