@@ -59,6 +59,7 @@ const FALLBACK_MODELS: CursorModel[] = [
   { id: "gpt-5.3-codex-spark-preview", name: "GPT-5.3 Codex Spark", reasoning: true, contextWindow: 128_000, maxTokens: 128_000 },
   // Other models
   { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
+  { id: "grok-4.6", name: "Grok 4.6", reasoning: true, contextWindow: 256_000, maxTokens: 64_000 },
   { id: "grok-code-fast-1", name: "Grok Code Fast 1", reasoning: false, contextWindow: 128_000, maxTokens: 64_000 },
 ];
 
