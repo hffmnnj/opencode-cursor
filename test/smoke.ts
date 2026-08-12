@@ -481,6 +481,65 @@ async function testNonStreamingProtocolErrorsAreStructured() {
   console.log("[test] Non-streaming protocol errors return structured responses");
 }
 
+async function testNonStreamingCollectionFailureContract() {
+  console.log("[test] Testing non-streaming truncation, stalls, and bridge failures...");
+  const promptSentinel = "non-streaming-secret-prompt-sentinel";
+  const forbidden = [
+    "secret-access-token",
+    "Bearer secret-access-token",
+    "session=secret-cookie",
+    promptSentinel,
+  ];
+  const scenarios: Array<{ scenario: CursorScenario; expected: string; environment?: Record<string, string> }> = [
+    { scenario: "missing-end-stream", expected: "Bridge exited with code 1 before Connect end-stream" },
+    { scenario: "transport-close-without-terminal", expected: "Bridge exited with code" },
+    {
+      scenario: "heartbeat-trickle-kept-open",
+      expected: "response_stall_timeout",
+      environment: {
+        CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "25",
+        CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS: "25",
+      },
+    },
+  ];
+
+  for (const { scenario, expected, environment = {} } of scenarios) {
+    const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+    fixture.setScenario(scenario);
+    try {
+      const result = await runScenarioSubprocess(fixture.apiUrl, `
+        const { startProxy, stopProxy } = await import("./src/proxy.ts");
+        const port = await startProxy(async () => "secret-access-token");
+        const response = await fetch("http://localhost:" + port + "/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer secret-access-token",
+            Cookie: "session=secret-cookie",
+          },
+          body: JSON.stringify({ model: "test", stream: false, messages: [{ role: "user", content: "${promptSentinel}" }] }),
+        });
+        const body = await response.json();
+        stopProxy();
+        console.log(JSON.stringify({ status: response.status, body }));
+        process.exit(0);
+      `, environment);
+      assertEqual(result.status, scenario === "heartbeat-trickle-kept-open" ? 504 : 500,
+        `${scenario} must return an explicit non-streaming error status`);
+      const serialized = JSON.stringify(result.body);
+      assert(serialized.includes(expected), `${scenario} must identify its terminal failure`);
+      assert(!serialized.includes('"finish_reason":"stop"'),
+        `${scenario} must not report clean completion without a completion signal`);
+      for (const secret of forbidden) {
+        assert(!serialized.includes(secret), `${scenario} error payload must redact ${secret}`);
+      }
+    } finally {
+      await fixture.close();
+    }
+  }
+  console.log("[test] Non-streaming failures are bounded, explicit, and sanitized");
+}
+
 async function runFakeScenario(apiUrl: string, scenario: CursorScenario): Promise<Buffer> {
   const session = http2.connect(apiUrl);
   const stream = session.request({
@@ -1502,6 +1561,7 @@ async function main() {
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
     await testNonStreamingProtocolErrorsAreStructured();
+    await testNonStreamingCollectionFailureContract();
     await testFakeCursorScenarioHarness();
     await testStreamingTermination();
     await testClientAbortTeardown();
