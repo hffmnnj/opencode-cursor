@@ -29,9 +29,10 @@ export type CursorScenario =
   | "semantic-progress-trickle"
   | "heartbeat-trickle"
   | "heartbeat-trickle-kept-open"
-  | "turn-ended-kept-open"
+  | "turn-ended-semantic-stall"
+  | "turn-ended-transport-close"
   | "checkpoint-trickle"
-  | "abrupt-session-close"
+  | "transport-close-without-terminal"
   | "frame-error"
   | "goaway"
   | "stream-aborted"
@@ -56,9 +57,10 @@ export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "semantic-progress-trickle",
   "heartbeat-trickle",
   "heartbeat-trickle-kept-open",
-  "turn-ended-kept-open",
+  "turn-ended-semantic-stall",
+  "turn-ended-transport-close",
   "checkpoint-trickle",
-  "abrupt-session-close",
+  "transport-close-without-terminal",
   "frame-error",
   "goaway",
   "stream-aborted",
@@ -388,14 +390,32 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
       case "heartbeat-trickle-kept-open":
         trickleUntilClosed(heartbeat());
         break;
-      case "turn-ended-kept-open":
-        stream.write(frameConnectMessage(turnEnded()));
+      case "turn-ended-semantic-stall":
+        // Reproduces Cursor's normal-looking completion shape: text and
+        // turnEnded arrive, but the HTTP/2 response remains open with no
+        // Connect end-stream. The proxy's current turnEnded no-op must leave
+        // the semantic-progress watchdog as the only terminal owner.
+        stream.write(Buffer.concat([
+          frameConnectMessage(textDelta("before-turn-ended-stall")),
+          frameConnectMessage(turnEnded()),
+        ]));
+        break;
+      case "turn-ended-transport-close":
+        // The present no-op for turnEnded defers termination to the transport
+        // close cascade rather than treating this as a clean completion.
+        stream.write(Buffer.concat([
+          frameConnectMessage(textDelta("before-turn-ended-close")),
+          frameConnectMessage(turnEnded()),
+        ]));
+        setTimeout(() => stream.session.destroy(), 10);
         break;
       case "checkpoint-trickle":
         trickle(checkpoint());
         break;
-      case "abrupt-session-close":
-        stream.write(frameConnectMessage(textDelta("before-close")));
+      case "transport-close-without-terminal":
+        // No turnEnded or Connect end-stream: this is an abnormal transport
+        // failure and must reach proxy.ts finishTerminal's explicit-error path.
+        stream.write(frameConnectMessage(textDelta("before-terminal-less-close")));
         setTimeout(() => stream.session.destroy(), 10);
         break;
       case "frame-error":

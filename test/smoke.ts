@@ -640,10 +640,11 @@ async function testStreamingTermination() {
   assertEqual(doneCount(malformedMessage.body), 1, "Malformed protobuf payloads must emit exactly one [DONE]");
   console.log("[test] Malformed protobuf payloads terminate explicitly exactly once");
 
-  const abruptClose = await observeProxyScenario("abrupt-session-close");
-  assert(abruptClose.body.includes("[Error:"), "Abrupt HTTP/2 closure must be surfaced as an error");
-  assertEqual(doneCount(abruptClose.body), 1, "Abrupt HTTP/2 closure must emit exactly one [DONE]");
-  console.log("[test] Abrupt HTTP/2 closure is an explicit error exactly once");
+  const terminalLessClose = await observeProxyScenario("transport-close-without-terminal");
+  assert(terminalLessClose.body.includes("before-terminal-less-close"), "Terminal-less closure must preserve preceding text");
+  assert(terminalLessClose.body.includes("[Error:"), "Closure without turnEnded or Connect end-stream must be surfaced as an error");
+  assertEqual(doneCount(terminalLessClose.body), 1, "Closure without a terminal signal must emit exactly one [DONE]");
+  console.log("[test] Terminal-less transport closure reaches finishTerminal as an explicit error exactly once");
 
   const frameError = await observeProxyScenario("frame-error");
   assert(frameError.body.includes("[Error:"), "HTTP/2 frame errors must be surfaced as an error");
@@ -687,10 +688,23 @@ async function testStreamingTermination() {
   assertEqual(doneCount(firstProgressStall.body), 1, "First-progress stalls must emit exactly one [DONE]");
   console.log("[test] First-progress stalls are bounded independently of transport liveness");
 
-  const turnEnded = await observeProxyScenario("turn-ended-kept-open");
-  assert(turnEnded.body.includes("[Error:"), "turnEnded transport closure must not become a clean success");
-  assertEqual(doneCount(turnEnded.body), 1, "turnEnded transport closure must emit exactly one [DONE]");
-  console.log("[test] turnEnded transport closure is an explicit error exactly once");
+  const turnEndedStall = await observeProxyScenario("turn-ended-semantic-stall", 250, {
+    CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "1000",
+    CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS: "25",
+    CURSOR_BRIDGE_SESSION_TIMEOUT_MS: "1000",
+    CURSOR_BRIDGE_PING_INTERVAL_MS: "1000",
+  });
+  assert(!turnEndedStall.timedOut, "turnEnded without Connect end-stream must be bounded by the semantic watchdog");
+  assert(turnEndedStall.body.includes("before-turn-ended-stall"), "turnEnded stall fixture must deliver the preceding text delta");
+  assert(turnEndedStall.body.includes("[Error: Cursor response stalled waiting for semantic progress]"), "Current turnEnded no-op must not terminate before the test-controlled semantic watchdog");
+  assertEqual(doneCount(turnEndedStall.body), 1, "Semantic watchdog termination after turnEnded must emit exactly one [DONE]");
+  console.log("[test] turnEnded is currently a no-op; only the semantic watchdog reaches finishTerminal");
+
+  const turnEndedClose = await observeProxyScenario("turn-ended-transport-close");
+  assert(turnEndedClose.body.includes("before-turn-ended-close"), "turnEnded transport-close fixture must deliver the preceding text delta");
+  assert(turnEndedClose.body.includes("[Error:"), "Current turnEnded no-op must defer terminal ownership to the close cascade");
+  assertEqual(doneCount(turnEndedClose.body), 1, "turnEnded followed by transport closure must emit exactly one [DONE]");
+  console.log("[test] turnEnded followed by transport closure reaches finishTerminal as an explicit error exactly once");
 
   const slowProgress = await observeProxyScenario("slow-semantic-progress", 500);
   assert(!slowProgress.timedOut, "Slow semantic progress exceeded its bounded completion window");
