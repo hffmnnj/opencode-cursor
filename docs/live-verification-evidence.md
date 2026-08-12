@@ -1,8 +1,8 @@
 # Live verification evidence
 
-**Date:** 2026-08-12  
-**Branch:** `test/cursor-live-validation`  
-**Commit under test:** `29c6d6d`  
+**Date:** 2026-08-12
+**Branch:** `test/cursor-live-validation`
+**Commit under test:** `29c6d6d`
 **Evidence class:** live validation with authenticated read-only state; lifecycle evidence is sanitized and limited to the proxy allowlist
 
 ## Isolation and safety
