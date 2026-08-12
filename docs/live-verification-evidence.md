@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-12  
 **Branch:** `test/cursor-live-validation`  
-**Commit under test:** `73681d7`  
+**Commit under test:** `29c6d6d`  
 **Evidence class:** live validation with authenticated read-only state; lifecycle evidence is sanitized and limited to the proxy allowlist
 
 ## Isolation and safety
@@ -15,6 +15,7 @@
 - **Authenticated resume:** with explicit authorization, the separate process referenced the existing credential state read-only. Its database, config, cache, and state paths remained under `/var/tmp/james/opencode/cursor-live-validation/`; no credential file was copied or edited.
 - The process loaded the branch-local plugin at `file:///home/james/Documents/opencode-cursor-fork/dist/index.js`, rather than a globally installed plugin.
 - CLI discovery proved that the requested bare string `cursor-grok-4.6` is not a valid model id in this OpenCode version. Cursor exposes qualified variants such as `cursor/cursor-grok-4.6-high`; the authenticated runs used that discovered id and `--variant high`.
+- Before the conclusive rerun, `bun run build` succeeded and refreshed the branch-local `dist/index.js`.
 
 ## Run record
 
@@ -27,10 +28,23 @@
 
 The four authenticated cases completed through the branch-local proxy. Deterministic fixture and smoke evidence remain separate and are not promoted to live evidence.
 
+## Conclusive normal-completion rerun
+
+The minimum normal case was rerun after rebuilding the branch-local plugin. The wall-clock elapsed time was **6.537 s**; the proxy lifecycle elapsed time to terminal cleanup was **2.373 s**. The sanitized diagnostics recorded:
+
+```text
+outbound_model modelId=cursor-grok-4.6-high
+message_dispatch messageCase=interactionUpdate interactionCase=heartbeat
+turn_ended transportState=writable writable=true elapsedMs=2372
+terminal elapsedMs=2373
+```
+
+The raw OpenCode response completed successfully. Raw output and diagnostics remain outside the repository.
+
 ## A1 and A7 verdicts
 
-- **A1, Cursor-facing id is `grok-4.6`: partially resolved.** The exact requested bare string is not accepted by this CLI. Authenticated discovery exposes `cursor/cursor-grok-4.6-high` and related variants, and that model routed successfully through the local plugin. The sanitized lifecycle allowlist does not include the outbound model id, so the wire-level id cannot be proven from committed diagnostics. No differing wire id was observed, but this is not a claim that the wire id was directly captured.
-- **A7, `turnEnded` is normal completion and H2 remains open: unresolved live.** All authenticated runs completed cleanly, and the long-reasoning case recorded a clean Connect `end_stream`. The allowlisted diagnostics recorded only `heartbeat` for message dispatch and did not expose a `turnEnded` event or an explicit “H2 open after turnEnded” observation. The result supports liveness but does not establish A7's precise event ordering.
+- **A1, Cursor-facing wire id:** **confirmed as `cursor-grok-4.6-high` for the tested high variant.** OpenCode's qualified model name is also `cursor/cursor-grok-4.6-high`; the proxy's `outbound_model.modelId` matched the provider-qualified id without the slash. This is a high-variant wire id, not the bare `grok-4.6` catalog id.
+- **A7, `turnEnded` is normal completion and H2 remains open:** **confirmed for the tested normal completion.** The sanitized `turn_ended` event occurred at 2.372 s with `transportState=writable` and `writable=true` before cleanup, proving the H2 transport remained writable when `turnEnded` arrived. The terminal event followed at 2.373 s.
 
 Existing deterministic evidence and prior-art research support the implementation direction, but neither answers these live-verification questions.
 
@@ -40,4 +54,4 @@ The captured artifacts were inspected only for structure and marker presence. Sa
 
 ## Reproduction requirement
 
-Residual limitations: the CLI requires a qualified variant model id; the exact bare `cursor-grok-4.6` string is not selectable in OpenCode 1.15.3. The idle case intentionally did not induce a provider stall. A7 needs a future diagnostic allowlist or provider-side trace that records `turnEnded` and post-event H2 state without exposing content or credentials. No product change is justified by these observations alone.
+Residual limitations: the CLI requires a qualified variant model id, and this conclusive run tested the high variant rather than the bare catalog id. The idle case intentionally did not induce a provider stall. The A1/A7 conclusions are direct observations of one authenticated normal completion; broader variant and failure-path coverage remains outside this rerun. No product change is justified by these observations.
