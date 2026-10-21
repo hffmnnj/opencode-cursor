@@ -330,7 +330,7 @@ interface SpawnBridgeOptions {
 function spawnBridge(options: SpawnBridgeOptions): {
   proc: ReturnType<typeof Bun.spawn>;
   /** Returns false when the child has already exited or its stdin rejects the frame. */
-  write: (data: Uint8Array) => boolean;
+  write: (data: Uint8Array, requireWritable?: boolean) => boolean;
   end: () => void;
   /** Stop the child when this request has reached a non-resumable terminal state. */
   terminate: () => void;
@@ -340,6 +340,8 @@ function spawnBridge(options: SpawnBridgeOptions): {
   get alive(): boolean;
   /** True only after the child reports a live, writable HTTP/2 transport. */
   get writable(): boolean;
+  /** Last child-reported transport state for lifecycle decisions and diagnostics. */
+  get transportState(): "connecting" | "writable" | "closed" | "failed";
 } {
   const proc = Bun.spawn(["node", BRIDGE_PATH], {
     stdin: "pipe",
@@ -414,7 +416,7 @@ function spawnBridge(options: SpawnBridgeOptions): {
   // Track exit state so late onClose registrations fire immediately.
   let exited = false;
   let exitCode = 1;
-  let writable = false;
+  let transportState: "connecting" | "writable" | "closed" | "failed" = "connecting";
 
   (async () => {
     const reader = proc.stdout.getReader();
@@ -436,10 +438,21 @@ function spawnBridge(options: SpawnBridgeOptions): {
           // a retained bridge can safely accept a tool-result resume.
           if (payload[0] === 1) {
             try {
-              const status = JSON.parse(payload.subarray(1).toString("utf8"));
-              writable = status.transport === "writable";
+              const status = JSON.parse(payload.subarray(1).toString("utf8")) as {
+                session?: unknown;
+                stream?: unknown;
+                writable?: unknown;
+              };
+              transportState = status.session === "open" && status.stream === "open" &&
+                status.writable === true
+                ? "writable"
+                : status.session === "failed" || status.stream === "failed"
+                  ? "failed"
+                  : status.session === "closed" || status.stream === "closed"
+                    ? "closed"
+                    : "connecting";
             } catch {
-              writable = false;
+              transportState = "failed";
             }
           } else if (payload[0] === 0) {
             cbs.data?.(Buffer.from(payload.subarray(1)));
@@ -459,9 +472,10 @@ function spawnBridge(options: SpawnBridgeOptions): {
   return {
     proc,
     get alive() { return !exited; },
-    get writable() { return !exited && writable; },
-    write(data) {
-      if (exited) return false;
+    get writable() { return !exited && transportState === "writable"; },
+    get transportState() { return transportState; },
+    write(data, requireWritable = false) {
+      if (exited || (requireWritable && transportState !== "writable")) return false;
       try {
         proc.stdin.write(lpEncode(data));
         return true;
@@ -698,7 +712,18 @@ async function handleChatCompletion(
       return handleToolResultResume(activeBridge, toolResults, userText, modelId, convKey);
     }
 
-    // Bridge died (timeout, server disconnect, etc.).
+    if (activeBridge.bridge.alive) {
+      // The subprocess can outlive its HTTP/2 session briefly. Its stdin is
+      // still writable at the OS level, but Cursor can no longer receive a
+      // resume frame. Fail this resume explicitly instead of silently queuing
+      // bytes and waiting for the semantic watchdog.
+      clearInterval(activeBridge.heartbeatTimer);
+      activeBridge.bridge.terminate();
+      return createUnavailableResumeResponse(modelId);
+    }
+
+    // A fully exited bridge has no live server-side state; retain the existing
+    // fresh-request fallback, which rebuilds from checkpoint and tool history.
     // Clean up and fall through to start a fresh bridge.
     clearInterval(activeBridge.heartbeatTimer);
     activeBridge.bridge.end();
@@ -994,6 +1019,10 @@ function buildCursorRequest(
   // "auto" is the proxy's pseudo-model for Cursor's server-side Auto
   // routing; the Run API expects modelId "default" for it.
   const cursorModelId = modelId === "auto" ? "default" : modelId;
+  // A model identifier is the sole request-derived field admitted to lifecycle
+  // diagnostics. Payloads, prompts, headers, and conversation state remain
+  // deliberately unobservable.
+  emitLifecycleDiagnostic("proxy", "outbound_model", { modelId: cursorModelId });
   const displayName = modelId === "auto" ? "Auto" : modelId;
   const requestedModel = create(RequestedModelSchema, {
     modelId: cursorModelId,
@@ -1904,7 +1933,16 @@ function createBridgeStreamResponse(
                 }
               },
               finishTerminal,
-              () => finishTerminal(),
+              () => {
+                // Capture the parent-observed H2 state before terminal cleanup
+                // tears down the bridge. This establishes whether Cursor ended
+                // a turn while its transport remained writable.
+                emitLifecycleDiagnostic("proxy", "turn_ended", {
+                  transportState: bridge.transportState,
+                  writable: bridge.writable,
+                });
+                finishTerminal();
+              },
             );
             if (!terminal) semanticWatchdog.observe();
             emitLifecycleDiagnostic("proxy", "message_dispatch", {
@@ -2016,6 +2054,11 @@ function handleToolResultResume(
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, cloudRule, pendingExecs } = active;
   emitLifecycleDiagnostic("proxy", "tool_resume", { toolCount: toolResults.length });
+  if (!bridge.writable) {
+    clearInterval(heartbeatTimer);
+    bridge.terminate();
+    return createUnavailableResumeResponse(modelId);
+  }
 
   // Answer each pending exec with a matching tool result: redirected native
   // execs get their typed native result frame, MCP execs get an mcpResult.
@@ -2034,10 +2077,16 @@ function handleToolResultResume(
     }
 
     if (result && exec.native) {
-      const sent = sendNativeExecResult(exec, exec.native, text, (bytes) =>
-        bridge.write(frameConnectMessage(bytes)),
-      );
-      if (sent) continue;
+      try {
+        const sent = sendNativeExecResult(exec, exec.native, text, (bytes) =>
+          bridge.write(frameConnectMessage(bytes), true),
+        );
+        if (sent) continue;
+      } catch {
+        clearInterval(heartbeatTimer);
+        bridge.terminate();
+        return createUnavailableResumeResponse(modelId);
+      }
     }
 
     const mcpResult = result
@@ -2077,9 +2126,14 @@ function handleToolResultResume(
       message: { case: "execClientMessage", value: execClientMessage },
     });
 
-    bridge.write(
+    if (!bridge.write(
       frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
-    );
+      true,
+    )) {
+      clearInterval(heartbeatTimer);
+      bridge.terminate();
+      return createUnavailableResumeResponse(modelId);
+    }
   }
 
   try {
@@ -2093,6 +2147,26 @@ function handleToolResultResume(
     bridge.terminate();
     throw error;
   }
+}
+
+/** A bounded SSE terminal for a paused bridge whose transport has failed. */
+function createUnavailableResumeResponse(modelId: string): Response {
+  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
+  const created = Math.floor(Date.now() / 1000);
+  const makeChunk = (delta: Record<string, unknown>, finishReason: string | null) => ({
+    id: completionId,
+    object: "chat.completion.chunk",
+    created,
+    model: modelId,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  });
+  const error = "Cursor bridge transport is unavailable for tool resume";
+  const body = [
+    `data: ${JSON.stringify(makeChunk({ content: `\n[Error: ${error}]` }, null))}\n\n`,
+    `data: ${JSON.stringify(makeChunk({}, "stop"))}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+  return new Response(body, { headers: SSE_HEADERS });
 }
 
 async function handleNonStreamingResponse(

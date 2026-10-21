@@ -39,11 +39,15 @@ match Grok 4.5/4.6 short-context pricing; `grok-4.20` itself is a different xAI 
 These items are **not** asserted as verified. Each is labelled with its confidence grade from the
 source Field Note.
 
-- **Cursor-facing model id string: UNVERIFIED (inference).** Presumed `grok-4.6`, matching the xAI
-  id and Cursor's docs path `/docs/models/grok-4-6`, but not yet confirmed against a live
-  `GetUsableModels` response (`fn_20260812_vaamzb8z`, "INFERENCE / UNCERTAIN"). Spec assumption A1
-  and the risk table treat a differing id as an open risk; live confirmation is scheduled for Wave 5.
-  The fallback catalog entry is a best-effort resilience path, not the authoritative discovery path.
+- **Cursor-facing model id string: PARTIALLY RESOLVED by live verification (Wave 5).** The
+  original inference presumed `grok-4.6`, matching the xAI id and Cursor's docs path
+  `/docs/models/grok-4-6`, but that was not yet confirmed against a live `GetUsableModels`
+  response (`fn_20260812_vaamzb8z`, "INFERENCE / UNCERTAIN"). Spec assumption A1 and the risk
+  table treated a differing id as an open risk. Wave 5 live validation resolved it for the
+  tested variant: OpenCode's qualified model name `cursor/cursor-grok-4.6-high` is sent to
+  Cursor's Run API as the wire id `cursor-grok-4.6-high` (see [§9](#9-live-id-verification-addendum-wave-5)).
+  The fallback catalog entry `grok-4.6` remains a best-effort resilience path, not the
+  authoritative discovery path.
 - **Billing pool: NO CLAIM MADE.** Whether Grok 4.6 on Cursor draws from the first-party pool or the
   API/third-party pool is UNCONFIRMED. Launch-day Reddit reports are anecdotal and internally
   inconsistent with Cursor's own grok page
@@ -163,3 +167,25 @@ Evidence: origin PR [#34](https://github.com/ephraimduncan/opencode-cursor/pull/
 
 - `bun run build` — PASS (documentation-only change; no source, tests, or dependencies touched).
 - `git diff --check` — PASS for the new document.
+
+## 9. Live id verification addendum (Wave 5)
+
+Wave 5 live validation (`docs/live-verification-evidence.md`, commits `29c6d6d`/`89668b7`)
+confirmed the Cursor-facing wire id for the tested variant through sanitized proxy diagnostics.
+This addendum records the live facts; it does not alter the prior-art verdicts in §3–§8.
+
+| Fact | Value | Evidence |
+|---|---|---|
+| OpenCode model name (discovered) | `cursor/cursor-grok-4.6-high` | Isolated CLI discovery; the bare string `cursor-grok-4.6` was rejected by OpenCode 1.15.3 (`docs/live-verification-evidence.md`). |
+| Cursor Run wire id (observed) | `cursor-grok-4.6-high` | Sanitized diagnostic `outbound_model modelId=cursor-grok-4.6-high` from the branch-local plugin. |
+| Normal-completion behavior (observed) | `turnEnded` at 2.372s with `transportState=writable`, `writable=true`; terminal at 2.373s | Sanitized `turn_ended`/`terminal` records; A7 confirmed for this completion. |
+
+Implications for the catalog: live discovery returns qualified variant ids such as
+`cursor/cursor-grok-4.6-high` rather than the bare `grok-4.6`; the fallback entry keeps the
+bare id as its resilience path and the Cursor-facing metadata (256K context, reasoning, 64K
+output). No catalog change was required: `normalizeSingleModel` already reuses fallback limit
+metadata for any discovered id, and the proxy routes whatever id it receives.
+
+The live evidence is a direct observation of one authenticated normal completion on the high
+variant; broader variant and failure-path coverage remains outside that rerun, and no product
+change is justified by these observations.

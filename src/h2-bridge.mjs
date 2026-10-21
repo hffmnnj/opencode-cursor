@@ -17,6 +17,7 @@
  * is written as the request body and the stream is ended immediately.
  * After config, subsequent stdin messages are raw bytes to write to the H2 stream.
  * H2 response data is written to stdout using the same length-prefixed framing.
+ * Control records use kind 1 and report the session/stream writability state.
  */
 import http2 from "node:http2";
 import crypto from "node:crypto";
@@ -28,6 +29,7 @@ const DEFAULT_SESSION_TIMEOUT_MS = 120_000;
 const MAX_PING_INTERVAL_MS = 300_000;
 const MAX_PING_TIMEOUT_MS = 60_000;
 const MAX_SESSION_TIMEOUT_MS = 600_000;
+const MAX_FAILURE_EXIT_DELAY_MS = 1_000;
 
 function boundedDuration(name, fallback, maximum) {
   const value = Number.parseInt(process.env[name] ?? "", 10);
@@ -43,8 +45,8 @@ function writeMessage(kind, data) {
   process.stdout.write(payload);
 }
 
-function writeTransportStatus(transport) {
-  writeMessage(1, Buffer.from(JSON.stringify({ transport })));
+function writeTransportStatus(session, stream, writable) {
+  writeMessage(1, Buffer.from(JSON.stringify({ session, stream, writable })));
 }
 
 // --- Buffered stdin reader ---
@@ -122,6 +124,7 @@ function emitDiagnostic(stage, details = {}) {
   try { process.stderr.write(`${JSON.stringify(event)}\n`); } catch {}
 }
 emitDiagnostic("bridge_start");
+writeTransportStatus("connecting", "opening", false);
 
 const client = http2.connect(url || "https://api2.cursor.sh");
 const pingIntervalMs = boundedDuration(
@@ -161,7 +164,7 @@ function sendPing() {
 
 client.on("connect", () => {
   emitDiagnostic("h2_connect");
-  writeTransportStatus("writable");
+  writeTransportStatus("open", "open", true);
   // PING validates the HTTP/2/TCP path, not model output. A 15s cadence and
   // 10s response window leave normal multi-minute model thinking untouched.
   pingInterval = setInterval(sendPing, pingIntervalMs);
@@ -186,11 +189,18 @@ let failed = false;
 function failBridge(errorName) {
   if (failed || cleanExit) return;
   failed = true;
-  writeTransportStatus("failed");
+  writeTransportStatus("failed", "failed", false);
   clearLivenessTimers();
   emitDiagnostic("terminal", { errorName, exitCode: 1 });
   try { client.destroy(); } catch {}
-  process.exit(1);
+  // The normal path exits immediately. Tests can retain this short, bounded
+  // window to exercise the parent-side failed-transport resume rejection
+  // while the child process itself is still alive.
+  const delay = boundedDuration(
+    "CURSOR_BRIDGE_FAILURE_EXIT_DELAY_MS", 0, MAX_FAILURE_EXIT_DELAY_MS,
+  );
+  if (delay > 0) setTimeout(() => process.exit(1), delay);
+  else process.exit(1);
 }
 
 client.on("error", () => failBridge("Http2SessionError"));
@@ -248,9 +258,10 @@ h2Stream.on("end", () => {
   clearLivenessTimers();
   if (!unary && !sawConnectEndStream) {
     failBridge("ConnectProtocolError");
+    return;
   }
   cleanExit = true;
-  writeTransportStatus("closed");
+  writeTransportStatus("closed", "closed", false);
   emitDiagnostic("terminal", { exitCode: 0 });
   client.close();
   // Give stdout time to flush

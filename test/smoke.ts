@@ -6,16 +6,20 @@ import {
   AgentServerMessageSchema,
   ConversationStateStructureSchema,
   ExecServerControlMessageSchema,
+  ExecServerMessageSchema,
   GetBlobArgsSchema,
   GetUsableModelsResponseSchema,
   HeartbeatUpdateSchema,
   InteractionQuerySchema,
   InteractionUpdateSchema,
   KvServerMessageSchema,
+  McpArgsSchema,
   ModelDetailsSchema,
   TextDeltaUpdateSchema,
   SetupVmEnvironmentArgsSchema,
   ThinkingDetailsSchema,
+  ThinkingDeltaUpdateSchema,
+  TokenDeltaUpdateSchema,
   TurnEndedUpdateSchema,
 } from "../src/proto/agent_pb";
 import {
@@ -477,6 +481,128 @@ async function testNonStreamingProtocolErrorsAreStructured() {
   console.log("[test] Non-streaming protocol errors return structured responses");
 }
 
+async function testBridgeInvalidEndStreamHasOneTerminalState() {
+  console.log("[test] Testing delayed bridge protocol-failure terminal ownership...");
+  const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  fixture.setScenario("missing-end-stream");
+  const lpEncode = (data: Uint8Array) => {
+    const frame = Buffer.alloc(4 + data.length);
+    frame.writeUInt32BE(data.length, 0);
+    frame.set(data, 4);
+    return frame;
+  };
+  try {
+    const bridge = Bun.spawn({
+      cmd: ["node", "src/h2-bridge.mjs"],
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        CURSOR_BRIDGE_FAILURE_EXIT_DELAY_MS: "50",
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const config = new TextEncoder().encode(JSON.stringify({
+      accessToken: "test-token",
+      url: fixture.apiUrl,
+      path: "/agent.v1.AgentService/Run",
+      unary: false,
+    }));
+    bridge.stdin.write(lpEncode(config));
+    bridge.stdin.write(lpEncode(new Uint8Array([0])));
+    bridge.stdin.end();
+
+    const [exitCode, stdout] = await Promise.all([
+      bridge.exited,
+      new Response(bridge.stdout).arrayBuffer(),
+    ]);
+    assertEqual(exitCode, 1, "A missing Connect end-stream must retain its failure exit code when delayed");
+
+    const controls: Array<{ session?: string; stream?: string; writable?: boolean }> = [];
+    const bytes = Buffer.from(stdout);
+    for (let offset = 0; offset + 4 <= bytes.length;) {
+      const length = bytes.readUInt32BE(offset);
+      offset += 4;
+      assert(offset + length <= bytes.length, "Bridge stdout framing must remain complete after protocol failure");
+      const payload = bytes.subarray(offset, offset + length);
+      offset += length;
+      if (payload[0] === 1) controls.push(JSON.parse(payload.subarray(1).toString("utf8")));
+    }
+    assertEqual(
+      controls.filter((status) => status.session === "failed" && status.stream === "failed").length,
+      1,
+      "A delayed Connect protocol failure must publish exactly one failed transport state",
+    );
+    assert(
+      !controls.some((status) => status.session === "closed" || status.stream === "closed"),
+      "A delayed Connect protocol failure must not publish a contradictory closed transport state",
+    );
+  } finally {
+    await fixture.close();
+  }
+  console.log("[test] Delayed Connect protocol failure remains failed exactly once without closed status");
+}
+
+async function testNonStreamingCollectionFailureContract() {
+  console.log("[test] Testing non-streaming truncation, stalls, and bridge failures...");
+  const promptSentinel = "non-streaming-secret-prompt-sentinel";
+  const forbidden = [
+    "secret-access-token",
+    "Bearer secret-access-token",
+    "session=secret-cookie",
+    promptSentinel,
+  ];
+  const scenarios: Array<{ scenario: CursorScenario; expected: string; environment?: Record<string, string> }> = [
+    { scenario: "missing-end-stream", expected: "Bridge exited with code 1 before Connect end-stream" },
+    { scenario: "transport-close-without-terminal", expected: "Bridge exited with code" },
+    {
+      scenario: "heartbeat-trickle-kept-open",
+      expected: "response_stall_timeout",
+      environment: {
+        CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "25",
+        CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS: "25",
+      },
+    },
+  ];
+
+  for (const { scenario, expected, environment = {} } of scenarios) {
+    const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+    fixture.setScenario(scenario);
+    try {
+      const result = await runScenarioSubprocess(fixture.apiUrl, `
+        const { startProxy, stopProxy } = await import("./src/proxy.ts");
+        const port = await startProxy(async () => "secret-access-token");
+        const response = await fetch("http://localhost:" + port + "/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer secret-access-token",
+            Cookie: "session=secret-cookie",
+          },
+          body: JSON.stringify({ model: "test", stream: false, messages: [{ role: "user", content: "${promptSentinel}" }] }),
+        });
+        const body = await response.json();
+        stopProxy();
+        console.log(JSON.stringify({ status: response.status, body }));
+        process.exit(0);
+      `, environment);
+      assertEqual(result.status, scenario === "heartbeat-trickle-kept-open" ? 504 : 500,
+        `${scenario} must return an explicit non-streaming error status`);
+      const serialized = JSON.stringify(result.body);
+      assert(serialized.includes(expected), `${scenario} must identify its terminal failure`);
+      assert(!serialized.includes('"finish_reason":"stop"'),
+        `${scenario} must not report clean completion without a completion signal`);
+      for (const secret of forbidden) {
+        assert(!serialized.includes(secret), `${scenario} error payload must redact ${secret}`);
+      }
+    } finally {
+      await fixture.close();
+    }
+  }
+  console.log("[test] Non-streaming failures are bounded, explicit, and sanitized");
+}
+
 async function runFakeScenario(apiUrl: string, scenario: CursorScenario): Promise<Buffer> {
   const session = http2.connect(apiUrl);
   const stream = session.request({
@@ -543,6 +669,7 @@ async function testFakeCursorScenarioHarness() {
 interface SseObservation {
   body: string;
   timedOut: boolean;
+  diagnostics: string[];
 }
 
 function doneCount(body: string): number {
@@ -600,7 +727,7 @@ async function observeProxyScenario(
       new Response(child.stderr).text(),
     ]);
     assertEqual(exitCode, 0, `Scenario subprocess failed (${scenario}): ${stderr}`);
-    return JSON.parse(stdout.trim()) as SseObservation;
+    return { ...JSON.parse(stdout.trim()) as Omit<SseObservation, "diagnostics">, diagnostics: stderr.trim().split("\n").filter(Boolean) };
   } finally {
     await fixture.close();
   }
@@ -826,6 +953,30 @@ async function testServerMessageClassification(modules: TestModules) {
   }) } });
   assertEqual(state.semanticProgressCount, 1, "Text output must count as semantic progress");
 
+  dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
+    message: { case: "thinkingDelta", value: create(ThinkingDeltaUpdateSchema, { text: "reasoning" }) },
+  }) } });
+  dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
+    message: { case: "tokenDelta", value: create(TokenDeltaUpdateSchema, { tokens: 1 }) },
+  }) } });
+  dispatch({ message: { case: "interactionUpdate", value: create(InteractionUpdateSchema, {
+    message: { case: "tokenDelta", value: create(TokenDeltaUpdateSchema, { tokens: 0 }) },
+  }) } });
+  dispatch({ message: { case: "execServerMessage", value: create(ExecServerMessageSchema, {
+    id: 1,
+    execId: "semantic-progress-exec",
+    message: {
+      case: "mcpArgs",
+      value: create(McpArgsSchema, {
+        name: "fixture-tool",
+        toolName: "fixture-tool",
+        toolCallId: "semantic-progress-call",
+        args: { input: new TextEncoder().encode("{}") },
+      }),
+    },
+  }) } });
+  assertEqual(state.semanticProgressCount, 4, "Thinking, positive token deltas, and exec transitions must count as semantic progress");
+
   let unsupportedError: Error | undefined;
   const safeQueryCases = [
     "webSearchRequestQuery",
@@ -844,6 +995,7 @@ async function testServerMessageClassification(modules: TestModules) {
     assert(!unsupportedError, `${queryCase} must be safely refused rather than terminal`);
     assert(responseBytes && responseBytes.length > 5, `${queryCase} must emit a typed interaction response`);
   }
+  assertEqual(state.semanticProgressCount, 4, "Interaction queries must not count as semantic progress");
   dispatch({ message: { case: "interactionQuery", value: create(InteractionQuerySchema, {
     id: 1,
     query: { case: "setupVmEnvironmentArgs", value: create(SetupVmEnvironmentArgsSchema, {}) },
@@ -888,11 +1040,12 @@ async function testServerMessageClassification(modules: TestModules) {
 async function runScenarioSubprocess(
   apiUrl: string,
   script: string,
+  environment: Record<string, string> = {},
 ): Promise<Record<string, unknown>> {
   const child = Bun.spawn({
     cmd: [process.execPath, "-e", script],
     cwd: process.cwd(),
-    env: { ...process.env, CURSOR_API_URL: apiUrl },
+    env: { ...process.env, CURSOR_API_URL: apiUrl, ...environment },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -909,6 +1062,7 @@ async function observeToolResume(
   apiUrl: string,
   scenario: "tool-pause-resume" | "tool-pause-transport-death",
   collision = false,
+  environment: Record<string, string> = {},
 ): Promise<Record<string, unknown>> {
   return runScenarioSubprocess(apiUrl, `
     import { startProxy, stopProxy } from "./src/proxy.ts";
@@ -933,15 +1087,17 @@ async function observeToolResume(
       second = await boundedText(await request([{ role: "user", content: opening }]));
       secondCall = JSON.parse(second.text.match(/data: (.+)\\n\\n/)?.[1] ?? "{}").choices?.[0]?.delta?.tool_calls?.[0]?.id;
     }
+    const resumeStartedAt = performance.now();
     const resumed = await boundedText(await request([
       { role: "user", content: opening },
       { role: "assistant", content: null, tool_calls: [{ id: firstCall, type: "function", function: { name: "fixture-tool", arguments: "{}" } }] },
       { role: "tool", tool_call_id: firstCall, content: "result-for-" + firstCall },
     ]));
+    const resumeElapsedMs = performance.now() - resumeStartedAt;
     stopProxy();
-    console.log(JSON.stringify({ first, firstCall, second, secondCall, resumed }));
+    console.log(JSON.stringify({ first, firstCall, second, secondCall, resumed, resumeElapsedMs }));
     process.exit(0);
-  `);
+  `, environment);
 }
 
 async function observeStalledRefresh(): Promise<Record<string, unknown>> {
@@ -1019,16 +1175,25 @@ async function testResumeRefreshAndNonStreaming(modules: TestModules) {
     console.log("[test] Identical-opening conversations retain isolated paused bridges");
 
     fixture.setScenario("tool-pause-transport-death");
-    const droppedWrite = await observeToolResume(fixture.apiUrl, "tool-pause-transport-death");
+    const droppedWrite = await observeToolResume(
+      fixture.apiUrl,
+      "tool-pause-transport-death",
+      false,
+      { CURSOR_BRIDGE_FAILURE_EXIT_DELAY_MS: "100" },
+    );
+    const elapsedMs = Number(droppedWrite.resumeElapsedMs);
+    const droppedWriteBody = String((droppedWrite.resumed as { text?: string }).text ?? "");
     assert(
-      String((droppedWrite.resumed as { text?: string }).text ?? "").includes('"finish_reason":"tool_calls"'),
-      "A closed transport must not accept a dropped resume write as a live bridge",
+      !Boolean((droppedWrite.resumed as { timedOut?: boolean }).timedOut) && elapsedMs < 150,
+      "A process-alive, transport-dead resume must terminate before the bounded observation window",
     );
     assert(
-      !String((droppedWrite.resumed as { text?: string }).text ?? "").includes("resumed-correctly"),
-      "A dead bridge must reject its pending result rather than accepting a stale write",
+      droppedWriteBody.includes("[Error: Cursor bridge transport is unavailable for tool resume]"),
+      "A process-alive dead transport must report the sanitized resume error",
     );
-    console.log("[test] Closed-stream bridge rejects stale writes and resumes through a fresh request");
+    assertEqual(doneCount(droppedWriteBody), 1, "A process-alive dead transport resume must emit exactly one [DONE]");
+    assert(!droppedWriteBody.includes("resumed-correctly"), "A dead transport must never accept a stale resume write");
+    console.log(`[test] Process-alive dead transport resume errors explicitly once in ${Math.round(elapsedMs)}ms`);
 
     fixture.setScenario("tool-pause-clean-exit");
     const port = await modules.startProxy(async () => "test-token");
@@ -1125,9 +1290,22 @@ async function testLifecycleDiagnostics(modules: TestModules) {
     for (const stage of [
       "proxy_entry", "auth_access_start", "auth_access_complete", "bridge_spawn",
       "bridge_start", "h2_connect", "connect_stream", "bridge_data", "connect_frame",
-      "message_dispatch", "sse_emission", "terminal",
+      "message_dispatch", "outbound_model", "sse_emission", "terminal",
     ]) {
       assert(stages.has(stage), `Missing diagnostic lifecycle stage: ${stage}`);
+    }
+    const outboundModel = events.find((event) => event.stage === "outbound_model");
+    assertEqual(outboundModel?.modelId, "test", "Outbound diagnostic must expose the selected Cursor wire model ID");
+    const allowedKeys = new Set([
+      "source", "stage", "requestId", "elapsedMs", "byteLength", "messageCase", "interactionCase",
+      "toolCount", "exitCode", "errorName", "status", "modelId", "transportState", "writable",
+      "parentElapsedMs",
+    ]);
+    for (const event of events) {
+      for (const [key, value] of Object.entries(event)) {
+        assert(allowedKeys.has(key), `Diagnostic event emitted non-allowlisted key: ${key}`);
+        assert(["string", "number", "boolean"].includes(typeof value), `Diagnostic value must be scalar: ${key}`);
+      }
     }
     const requestIds = new Set(events.map((event) => event.requestId));
     assertEqual(requestIds.size, 1, "Expected one shared diagnostic correlation ID");
@@ -1135,6 +1313,19 @@ async function testLifecycleDiagnostics(modules: TestModules) {
     const output = enabled.lines.join("\n");
     for (const secret of [fakeToken, secretPrompt, secretToolPayload]) {
       assert(!output.includes(secret), `Diagnostic output leaked secret: ${secret}`);
+    }
+
+    const turnEnded = await observeProxyScenario("turn-ended-transport-close", 125, {
+      CURSOR_PROXY_DIAGNOSTICS: "1",
+    });
+    const turnEndedEvents = turnEnded.diagnostics.map((line) => JSON.parse(line) as Record<string, unknown>);
+    const turnEndedEvent = turnEndedEvents.find((event) => event.stage === "turn_ended");
+    assert(turnEndedEvent, "turnEnded dispatch must emit a lifecycle diagnostic");
+    assertEqual(turnEndedEvent.transportState, "writable", "turnEnded diagnostic must capture pre-cleanup transport state");
+    assertEqual(turnEndedEvent.writable, true, "turnEnded diagnostic must capture pre-cleanup writability");
+    const turnEndedOutput = turnEnded.diagnostics.join("\n");
+    for (const secret of ["test-token", "reproduce termination behavior"]) {
+      assert(!turnEndedOutput.includes(secret), `turnEnded diagnostic leaked secret or prompt: ${secret}`);
     }
   } finally {
     if (originalSetting === undefined) delete process.env.CURSOR_PROXY_DIAGNOSTICS;
@@ -1460,6 +1651,8 @@ async function main() {
     await testPluginShape(modules);
     await testArrayContentParsing(modules);
     await testNonStreamingProtocolErrorsAreStructured();
+    await testBridgeInvalidEndStreamHasOneTerminalState();
+    await testNonStreamingCollectionFailureContract();
     await testFakeCursorScenarioHarness();
     await testStreamingTermination();
     await testClientAbortTeardown();
