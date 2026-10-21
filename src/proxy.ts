@@ -1019,6 +1019,10 @@ function buildCursorRequest(
   // "auto" is the proxy's pseudo-model for Cursor's server-side Auto
   // routing; the Run API expects modelId "default" for it.
   const cursorModelId = modelId === "auto" ? "default" : modelId;
+  // A model identifier is the sole request-derived field admitted to lifecycle
+  // diagnostics. Payloads, prompts, headers, and conversation state remain
+  // deliberately unobservable.
+  emitLifecycleDiagnostic("proxy", "outbound_model", { modelId: cursorModelId });
   const displayName = modelId === "auto" ? "Auto" : modelId;
   const requestedModel = create(RequestedModelSchema, {
     modelId: cursorModelId,
@@ -1929,7 +1933,16 @@ function createBridgeStreamResponse(
                 }
               },
               finishTerminal,
-              () => finishTerminal(),
+              () => {
+                // Capture the parent-observed H2 state before terminal cleanup
+                // tears down the bridge. This establishes whether Cursor ended
+                // a turn while its transport remained writable.
+                emitLifecycleDiagnostic("proxy", "turn_ended", {
+                  transportState: bridge.transportState,
+                  writable: bridge.writable,
+                });
+                finishTerminal();
+              },
             );
             if (!terminal) semanticWatchdog.observe();
             emitLifecycleDiagnostic("proxy", "message_dispatch", {
