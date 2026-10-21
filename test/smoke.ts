@@ -14,6 +14,8 @@ import {
   KvServerMessageSchema,
   ModelDetailsSchema,
   TextDeltaUpdateSchema,
+  SetupVmEnvironmentArgsSchema,
+  ThinkingDetailsSchema,
   TurnEndedUpdateSchema,
 } from "../src/proto/agent_pb";
 import {
@@ -188,6 +190,12 @@ async function createTestCursorBackend(): Promise<TestCursorBackend> {
                       displayName: model.name,
                       displayNameShort: model.name,
                       aliases: [],
+                      // The protobuf only expresses thinking support by
+                      // presence, so a truthy reasoning flag emits a
+                      // thinkingDetails object; false/absent leaves it out.
+                      ...(model.reasoning
+                        ? { thinkingDetails: create(ThinkingDetailsSchema, {}) }
+                        : {}),
                     }),
                   ),
                 }),
@@ -541,6 +549,10 @@ function doneCount(body: string): number {
   return body.split("data: [DONE]").length - 1;
 }
 
+function errorCount(body: string): number {
+  return body.split("[Error:").length - 1;
+}
+
 async function observeProxyScenario(
   scenario: CursorScenario,
   deadlineMs = 125,
@@ -633,10 +645,12 @@ async function testStreamingTermination() {
   assertEqual(doneCount(malformedMessage.body), 1, "Malformed protobuf payloads must emit exactly one [DONE]");
   console.log("[test] Malformed protobuf payloads terminate explicitly exactly once");
 
-  const abruptClose = await observeProxyScenario("abrupt-session-close");
-  assert(abruptClose.body.includes("[Error:"), "Abrupt HTTP/2 closure must be surfaced as an error");
-  assertEqual(doneCount(abruptClose.body), 1, "Abrupt HTTP/2 closure must emit exactly one [DONE]");
-  console.log("[test] Abrupt HTTP/2 closure is an explicit error exactly once");
+  const terminalLessClose = await observeProxyScenario("transport-close-without-terminal");
+  assert(terminalLessClose.body.includes("before-terminal-less-close"), "Terminal-less closure must preserve preceding text");
+  assert(terminalLessClose.body.includes("[Error:"), "Closure without turnEnded or Connect end-stream must be surfaced as an error");
+  assertEqual(errorCount(terminalLessClose.body), 1, "Closure without a terminal signal must emit exactly one explicit error");
+  assertEqual(doneCount(terminalLessClose.body), 1, "Closure without a terminal signal must emit exactly one [DONE]");
+  console.log("[test] Terminal-less transport closure reaches finishTerminal as an explicit error exactly once");
 
   const frameError = await observeProxyScenario("frame-error");
   assert(frameError.body.includes("[Error:"), "HTTP/2 frame errors must be surfaced as an error");
@@ -680,10 +694,40 @@ async function testStreamingTermination() {
   assertEqual(doneCount(firstProgressStall.body), 1, "First-progress stalls must emit exactly one [DONE]");
   console.log("[test] First-progress stalls are bounded independently of transport liveness");
 
-  const turnEnded = await observeProxyScenario("turn-ended-kept-open");
-  assert(turnEnded.body.includes("[Error:"), "turnEnded transport closure must not become a clean success");
-  assertEqual(doneCount(turnEnded.body), 1, "turnEnded transport closure must emit exactly one [DONE]");
-  console.log("[test] turnEnded transport closure is an explicit error exactly once");
+  const turnEndedStall = await observeProxyScenario("turn-ended-semantic-stall", 250, {
+    CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "1000",
+    CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS: "25",
+    CURSOR_BRIDGE_SESSION_TIMEOUT_MS: "1000",
+    CURSOR_BRIDGE_PING_INTERVAL_MS: "1000",
+  });
+  assert(!turnEndedStall.timedOut, "turnEnded without Connect end-stream must terminate promptly");
+  assert(turnEndedStall.body.includes("before-turn-ended-stall"), "turnEnded stall fixture must deliver the preceding text delta");
+  assertEqual(errorCount(turnEndedStall.body), 0, "turnEnded must complete cleanly before the semantic watchdog");
+  assert(turnEndedStall.body.includes('"finish_reason":"stop"'), "turnEnded must emit a stop terminal chunk");
+  assert(turnEndedStall.body.includes('"usage":'), "turnEnded must emit a usage terminal chunk");
+  assertEqual(doneCount(turnEndedStall.body), 1, "turnEnded must emit exactly one [DONE]");
+  console.log("[test] turnEnded completes the open response before the semantic watchdog");
+
+  const turnEndedClose = await observeProxyScenario("turn-ended-transport-close");
+  assert(turnEndedClose.body.includes("before-turn-ended-close"), "turnEnded transport-close fixture must deliver the preceding text delta");
+  assertEqual(errorCount(turnEndedClose.body), 0, "Transport closure after turnEnded must stay clean and idempotent");
+  assert(turnEndedClose.body.includes('"finish_reason":"stop"'), "turnEnded transport-close must emit a stop terminal chunk");
+  assert(turnEndedClose.body.includes('"usage":'), "turnEnded transport-close must emit a usage terminal chunk");
+  assertEqual(doneCount(turnEndedClose.body), 1, "turnEnded followed by transport closure must emit exactly one [DONE]");
+  console.log("[test] turnEnded followed by transport closure remains clean exactly once");
+
+  const refusedQuery = await observeProxyScenario("interaction-query-continue");
+  assert(!refusedQuery.timedOut, "A safely refused interaction query must let the same turn continue");
+  assert(refusedQuery.body.includes("after-query-refusal"), "The server must continue after its typed query rejection");
+  assertEqual(errorCount(refusedQuery.body), 0, "A safely refused query must not produce an SSE error");
+  assertEqual(doneCount(refusedQuery.body), 1, "A safely refused query followed by turnEnded must emit exactly one [DONE]");
+  console.log("[test] Typed interaction-query refusal continues to a clean turnEnded terminal");
+
+  const unsupportedControl = await observeProxyScenario("exec-server-control");
+  assert(unsupportedControl.body.includes("Unsupported Cursor exec control message: abort"), "Unsupported server controls must surface an explicit error");
+  assertEqual(errorCount(unsupportedControl.body), 1, "Unsupported server controls must emit exactly one explicit error");
+  assertEqual(doneCount(unsupportedControl.body), 1, "Unsupported server controls must emit exactly one [DONE]");
+  console.log("[test] Unsupported server controls terminate with one explicit error and one [DONE]");
 
   const slowProgress = await observeProxyScenario("slow-semantic-progress", 500);
   assert(!slowProgress.timedOut, "Slow semantic progress exceeded its bounded completion window");
@@ -783,11 +827,28 @@ async function testServerMessageClassification(modules: TestModules) {
   assertEqual(state.semanticProgressCount, 1, "Text output must count as semantic progress");
 
   let unsupportedError: Error | undefined;
+  const safeQueryCases = [
+    "webSearchRequestQuery",
+    "askQuestionInteractionQuery",
+    "switchModeRequestQuery",
+    "exaSearchRequestQuery",
+    "exaFetchRequestQuery",
+    "createPlanRequestQuery",
+  ] as const;
+  for (const queryCase of safeQueryCases) {
+    let responseBytes: Uint8Array | undefined;
+    dispatch({ message: { case: "interactionQuery", value: create(InteractionQuerySchema, {
+      id: 1,
+      query: { case: queryCase, value: {} },
+    }) } }, (error) => { unsupportedError = error; }, (bytes) => { responseBytes = bytes; });
+    assert(!unsupportedError, `${queryCase} must be safely refused rather than terminal`);
+    assert(responseBytes && responseBytes.length > 5, `${queryCase} must emit a typed interaction response`);
+  }
   dispatch({ message: { case: "interactionQuery", value: create(InteractionQuerySchema, {
     id: 1,
-    query: { case: "webSearchRequestQuery", value: {} },
+    query: { case: "setupVmEnvironmentArgs", value: create(SetupVmEnvironmentArgsSchema, {}) },
   }) } }, (error) => { unsupportedError = error; });
-  assert(unsupportedError?.message.includes("Unsupported Cursor interaction query"), "Unsupported blocking queries must trigger an explicit terminal error");
+  assertEqual(unsupportedError?.message, "Unsupported Cursor interaction query: setupVmEnvironmentArgs", "VM setup must remain an explicit terminal error because its response has no rejection arm");
   unsupportedError = undefined;
   dispatch({ message: { case: "execServerControlMessage", value: create(ExecServerControlMessageSchema, {
     message: { case: "abort", value: { id: 1 } },
@@ -821,7 +882,7 @@ async function testServerMessageClassification(modules: TestModules) {
     "Failed to write native tool result to Cursor bridge",
     "A dead bridge must explicitly reject native tool-result writes",
   );
-  console.log("[test] Liveness traffic is non-progress and unsupported queries terminate explicitly");
+  console.log("[test] Liveness traffic is non-progress; safe queries reject-and-continue while controls fail explicitly");
 }
 
 async function runScenarioSubprocess(
@@ -1207,6 +1268,178 @@ async function testDiscoveryFallbackAndSuccess(
   console.log("[test] Discovery fallback and success OK");
 }
 
+async function testGrok46CatalogAndRouting(
+  modules: TestModules,
+  backend: TestCursorBackend,
+) {
+  console.log("[test] Testing Grok 4.6 catalog exposure, cost, and routing...");
+
+  // Fallback discovery exposes grok-4.6 with the Cursor-facing metadata and
+  // leaves grok-code-fast-1 untouched.
+  modules.clearModelCache();
+  backend.setDiscoveryMode("empty");
+  const fallback = await modules.getCursorModels("test-token");
+  const grok46 = fallback.find((model) => model.id === "grok-4.6");
+  assert(grok46, "Fallback discovery must expose grok-4.6");
+  assertEqual(grok46.name, "Grok 4.6", "grok-4.6 fallback display name");
+  assertEqual(grok46.reasoning, true, "grok-4.6 fallback must be reasoning-enabled");
+  assertEqual(grok46.contextWindow, 256_000, "grok-4.6 fallback must use the Cursor-facing 256K context");
+  assertEqual(grok46.maxTokens, 64_000, "grok-4.6 fallback max tokens");
+  const grokCodeFast = fallback.find((model) => model.id === "grok-code-fast-1");
+  assert(grokCodeFast, "Fallback discovery must keep grok-code-fast-1");
+  assertEqual(grokCodeFast.reasoning, false, "grok-code-fast-1 must stay non-reasoning");
+  assertEqual(grokCodeFast.contextWindow, 128_000, "grok-code-fast-1 must keep its 128K context");
+
+  // Live discovery normalizes known models to their fallback limits: the
+  // GetUsableModels protobuf carries no limit fields, so a live grok-4.6 must
+  // still report the Cursor-facing 256K/64K with reasoning true, while the
+  // discovery display name stays authoritative. Unknown models keep generic
+  // defaults.
+  modules.clearModelCache();
+  backend.setDiscoveryMode("success");
+  backend.setDiscoveredModels([
+    { id: "grok-4.6", name: "Grok 4.6" },
+    { id: "unknown-live-model", name: "Unknown Live Model" },
+  ]);
+  const live = await modules.getCursorModels("test-token");
+  const liveGrok46 = live.find((model) => model.id === "grok-4.6");
+  assert(liveGrok46, "Live discovery must expose grok-4.6");
+  assertEqual(liveGrok46.name, "Grok 4.6", "Live grok-4.6 must use the discovery display name");
+  assertEqual(liveGrok46.reasoning, true, "Live grok-4.6 must reuse fallback reasoning when discovery omits thinking details");
+  assertEqual(liveGrok46.contextWindow, 256_000, "Live grok-4.6 must normalize to the Cursor-facing 256K context");
+  assertEqual(liveGrok46.maxTokens, 64_000, "Live grok-4.6 must normalize to 64K max tokens");
+  const unknownLive = live.find((model) => model.id === "unknown-live-model");
+  assert(unknownLive, "Live discovery must expose the unknown model");
+  assertEqual(unknownLive.name, "Unknown Live Model", "Unknown live model keeps its discovery display name");
+  assertEqual(unknownLive.reasoning, false, "Unknown live model keeps the generic non-reasoning default");
+  assertEqual(unknownLive.contextWindow, 200_000, "Unknown live model keeps the generic 200K context default");
+  assertEqual(unknownLive.maxTokens, 64_000, "Unknown live model keeps the generic 64K max-tokens default");
+
+  // Discovery fields stay authoritative where present: thinkingDetails emitted
+  // by Cursor overrides the fallback reasoning flag, while known limits still
+  // normalize from fallback metadata.
+  modules.clearModelCache();
+  backend.setDiscoveredModels([
+    { id: "grok-code-fast-1", name: "Grok Code Fast 1", reasoning: true },
+  ]);
+  const authoritative = await modules.getCursorModels("test-token");
+  const authoritativeGcf = authoritative.find((model) => model.id === "grok-code-fast-1");
+  assert(authoritativeGcf, "Live discovery must expose grok-code-fast-1");
+  assertEqual(authoritativeGcf.reasoning, true, "Discovery thinkingDetails must override fallback reasoning");
+  assertEqual(authoritativeGcf.contextWindow, 128_000, "Known limits must still normalize from fallback metadata");
+  assertEqual(authoritativeGcf.maxTokens, 64_000, "Known max tokens must still normalize from fallback metadata");
+
+  // The v2 catalog hook (auth.loader -> provider.models) emits a complete
+  // Grok 4.6 entry: limits, reasoning flag, explicit cost, text-only caps.
+  const authState = {
+    type: "oauth" as const,
+    access: makeJwt(Math.floor(Date.now() / 1000) + 3600),
+    refresh: "valid-refresh",
+    expires: Date.now() + 3_600_000,
+  };
+  const hooks = await modules.CursorAuthPlugin({
+    client: { auth: { set: async () => {} } },
+  } as any);
+  const provider = { models: {} } as any;
+  modules.clearModelCache();
+  backend.setDiscoveryMode("empty");
+  const catalogConfig = await hooks.auth!.loader(async () => authState, provider);
+  assert(catalogConfig.baseURL, "Catalog hook must start the proxy");
+  const catalogEntry = (provider.models as Record<string, any>)["grok-4.6"];
+  assert(catalogEntry, "Catalog hook must emit a grok-4.6 entry");
+  assertEqual(catalogEntry.name, "Grok 4.6", "Catalog entry display name");
+  assertEqual(catalogEntry.capabilities.reasoning, true, "Catalog entry must advertise reasoning");
+  assertEqual(catalogEntry.limit.context, 256_000, "Catalog entry context limit");
+  assertEqual(catalogEntry.limit.output, 64_000, "Catalog entry output limit");
+  assertEqual(catalogEntry.cost.input, 2, "grok-4.6 input cost must be $2/M, not the generic grok pattern");
+  assertEqual(catalogEntry.cost.output, 6, "grok-4.6 output cost must be $6/M, not the generic grok pattern");
+  assertEqual(catalogEntry.cost.cache.read, 0.5, "grok-4.6 cached-read cost must be $0.50/M");
+  assertEqual(catalogEntry.cost.cache.write, 0, "grok-4.6 cache-write cost must be $0/M");
+  assertEqual(catalogEntry.capabilities.attachment, false, "grok-4.6 must stay text-only for attachments");
+  assertEqual(catalogEntry.capabilities.input.image, false, "grok-4.6 must stay text-only for images");
+
+  // The config hook (opencode >= 1.18 config schema) emits the same entry.
+  modules.clearModelCache();
+  backend.setDiscoveryMode("empty");
+  process.env.OPENCODE_AUTH_CONTENT = JSON.stringify({
+    cursor: {
+      type: "oauth",
+      refresh: "valid-refresh",
+      access: makeJwt(Math.floor(Date.now() / 1000) + 3600),
+      expires: Date.now() + 3_600_000,
+    },
+  });
+  try {
+    const cfg: any = { provider: {} };
+    await hooks.config!(cfg);
+    const configEntry = cfg.provider?.cursor?.models?.["grok-4.6"];
+    assert(configEntry, "Config hook must emit a grok-4.6 entry");
+    assertEqual(configEntry.name, "Grok 4.6", "Config entry display name");
+    assertEqual(configEntry.reasoning, true, "Config entry must advertise reasoning");
+    assertEqual(configEntry.limit.context, 256_000, "Config entry context limit");
+    assertEqual(configEntry.limit.output, 64_000, "Config entry output limit");
+    assertEqual(configEntry.cost.input, 2, "Config entry input cost must be $2/M");
+    assertEqual(configEntry.cost.output, 6, "Config entry output cost must be $6/M");
+    assertEqual(configEntry.cost.cache_read, 0.5, "Config entry cached-read cost must be $0.50/M");
+    assertEqual(configEntry.cost.cache_write, 0, "Config entry cache-write cost must be $0/M");
+  } finally {
+    delete process.env.OPENCODE_AUTH_CONTENT;
+  }
+  modules.stopProxy();
+
+  // Both request paths accept grok-4.6 and route the id to Cursor's Run API
+  // through the model-agnostic proxy, with no model-specific branch. The child
+  // process loads the proxy with the fixture as its Cursor endpoint.
+  const fixture = await createFakeCursorServer({ deadlineMs: 1_000 });
+  try {
+    fixture.setScenario("clean-end-stream");
+    const routing = await runScenarioSubprocess(fixture.apiUrl, `
+      const { startProxy, stopProxy } = await import("./src/proxy.ts");
+      const port = await startProxy(async () => "test-token");
+      const streamRes = await fetch("http://localhost:" + port + "/v1/chat/completions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "grok-4.6", stream: true, messages: [{ role: "user", content: "route grok-4.6 through streaming" }] }),
+      });
+      const streamBody = await streamRes.text();
+      const nonStreamRes = await fetch("http://localhost:" + port + "/v1/chat/completions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "grok-4.6", stream: false, messages: [{ role: "user", content: "route grok-4.6 through non-streaming" }] }),
+      });
+      const nonStreamBody = await nonStreamRes.json();
+      stopProxy();
+      console.log(JSON.stringify({
+        streamStatus: streamRes.status,
+        streamDone: streamBody.includes("data: [DONE]"),
+        streamEcho: streamBody.includes('"model":"grok-4.6"'),
+        nonStreamStatus: nonStreamRes.status,
+        nonStreamModel: nonStreamBody.model,
+      }));
+      process.exit(0);
+    `);
+    assertEqual(routing.streamStatus, 200, "Streaming path must accept grok-4.6");
+    assertEqual(routing.streamDone, true, "Streaming path must complete for grok-4.6");
+    assertEqual(routing.streamEcho, true, "Streaming chunks must echo the grok-4.6 model id");
+    assertEqual(routing.nonStreamStatus, 200, "Non-streaming path must accept grok-4.6");
+    assertEqual(routing.nonStreamModel, "grok-4.6", "Non-streaming response must echo the grok-4.6 model id");
+
+    const deadline = Date.now() + 500;
+    while (
+      Date.now() < deadline &&
+      fixture.getRunRequestModelIds().filter((id) => id === "grok-4.6").length < 2
+    ) {
+      await Bun.sleep(10);
+    }
+    assertEqual(
+      fixture.getRunRequestModelIds().filter((id) => id === "grok-4.6").length,
+      2,
+      "Both streaming and non-streaming requests must route grok-4.6 to Cursor's Run API",
+    );
+  } finally {
+    await fixture.close();
+  }
+  console.log("[test] Grok 4.6 catalog exposure, cost, and routing OK");
+}
+
 async function main() {
   const backend = await createTestCursorBackend();
   process.env.CURSOR_API_URL = backend.apiUrl;
@@ -1235,6 +1468,7 @@ async function main() {
     await testLifecycleDiagnostics(modules);
     await testExpiredTokenRefreshBeforeDiscovery(modules, backend);
     await testDiscoveryFallbackAndSuccess(modules, backend);
+    await testGrok46CatalogAndRouting(modules, backend);
     await Bun.sleep(0);
     assert(!unhandledRejection, `Unhandled rejection escaped the smoke harness: ${String(unhandledRejection)}`);
     console.log("\n✓ All smoke tests passed");

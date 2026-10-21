@@ -168,6 +168,26 @@ tokens or headers, cookies, prompt/message text, tool arguments/results, or blob
 The parent always drains child stderr even while diagnostics are disabled, preventing pipe
 backpressure from stalling the bridge.
 
+## Interaction-query disposition
+
+Adapted with attribution to `tanushshukla/opencode-cursor@a067e099`: an unanswered
+`InteractionQuery` can make the Cursor server wait indefinitely while an otherwise valid turn
+has already begun. The proxy sends a typed negative response and continues for every generated
+query whose response schema has a refusal arm: `webSearchRequestQuery`,
+`askQuestionInteractionQuery`, `switchModeRequestQuery`, `exaSearchRequestQuery`,
+`exaFetchRequestQuery`, and `createPlanRequestQuery` (the last uses its typed error result).
+
+`setupVmEnvironmentArgs` remains terminal because its generated response schema has only a
+success arm: acknowledging it would falsely claim privileged environment setup completed.
+`execServerControlMessage` also remains fail-fast because OpenCode has no safe acknowledgement
+for Cursor's server-control contract. Exhaustive `never` defaults ensure future generated
+variants cannot silently acquire a disposition.
+
+The smoke fixture proves a rejected web-search query continues on the same turn to text and a
+clean `turnEnded` terminal. It also proves `execServerControlMessage` produces exactly one
+explicit error and one `[DONE]`; classification tests cover every generated safe refusal plus
+the VM fail-fast boundary.
+
 ## Evidence sources
 
 - Field notes: unhandled server-message families / raw-byte timer resets (leading hang

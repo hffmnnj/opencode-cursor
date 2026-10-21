@@ -59,8 +59,19 @@ const FALLBACK_MODELS: CursorModel[] = [
   { id: "gpt-5.3-codex-spark-preview", name: "GPT-5.3 Codex Spark", reasoning: true, contextWindow: 128_000, maxTokens: 128_000 },
   // Other models
   { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 64_000 },
+  { id: "grok-4.6", name: "Grok 4.6", reasoning: true, contextWindow: 256_000, maxTokens: 64_000 },
   { id: "grok-code-fast-1", name: "Grok Code Fast 1", reasoning: false, contextWindow: 128_000, maxTokens: 64_000 },
 ];
+
+/**
+ * Known catalog metadata keyed by id. The GetUsableModels protobuf carries
+ * no limit fields, so live-discovered models reuse these context/max-token
+ * (and, when discovery omits them, display/reasoning) values while keeping
+ * discovery fields such as displayName and thinkingDetails authoritative.
+ */
+const FALLBACK_MODEL_BY_ID = new Map(
+  FALLBACK_MODELS.map((model) => [model.id, model] as const),
+);
 
 /**
  * Pseudo-model for Cursor's server-side Auto routing. Always exposed
@@ -184,12 +195,19 @@ function normalizeSingleModel(model: unknown): CursorModel | null {
   const id = details.modelId.trim();
   if (!id) return null;
 
+  const known = FALLBACK_MODEL_BY_ID.get(id);
+  const hasThinkingDetails = details.thinkingDetails !== undefined;
+
   return {
     id,
-    name: pickDisplayName(details, id),
-    reasoning: Boolean(details.thinkingDetails),
-    contextWindow: DEFAULT_CONTEXT_WINDOW,
-    maxTokens: DEFAULT_MAX_TOKENS,
+    name: pickDisplayName(details, known?.name ?? id),
+    // Discovery fields win when present; known fallback metadata fills the
+    // gaps left by the limit-less GetUsableModels protobuf.
+    reasoning: hasThinkingDetails
+      ? Boolean(details.thinkingDetails)
+      : (known?.reasoning ?? false),
+    contextWindow: known?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+    maxTokens: known?.maxTokens ?? DEFAULT_MAX_TOKENS,
   };
 }
 

@@ -1,12 +1,15 @@
 import http2 from "node:http2";
 import type { AddressInfo } from "node:net";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
+  AgentClientMessageSchema,
   AgentServerMessageSchema,
   ConversationStateStructureSchema,
+  ExecServerControlMessageSchema,
   ExecServerMessageSchema,
   HeartbeatUpdateSchema,
   InteractionUpdateSchema,
+  InteractionQuerySchema,
   McpArgsSchema,
   TextDeltaUpdateSchema,
   TurnEndedUpdateSchema,
@@ -28,9 +31,10 @@ export type CursorScenario =
   | "semantic-progress-trickle"
   | "heartbeat-trickle"
   | "heartbeat-trickle-kept-open"
-  | "turn-ended-kept-open"
+  | "turn-ended-semantic-stall"
+  | "turn-ended-transport-close"
   | "checkpoint-trickle"
-  | "abrupt-session-close"
+  | "transport-close-without-terminal"
   | "frame-error"
   | "goaway"
   | "stream-aborted"
@@ -39,7 +43,9 @@ export type CursorScenario =
   | "transport-death"
   | "tool-pause-resume"
   | "tool-pause-transport-death"
-  | "tool-pause-clean-exit";
+  | "tool-pause-clean-exit"
+  | "interaction-query-continue"
+  | "exec-server-control";
 
 export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "clean-end-stream",
@@ -55,9 +61,10 @@ export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "semantic-progress-trickle",
   "heartbeat-trickle",
   "heartbeat-trickle-kept-open",
-  "turn-ended-kept-open",
+  "turn-ended-semantic-stall",
+  "turn-ended-transport-close",
   "checkpoint-trickle",
-  "abrupt-session-close",
+  "transport-close-without-terminal",
   "frame-error",
   "goaway",
   "stream-aborted",
@@ -67,6 +74,8 @@ export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "tool-pause-resume",
   "tool-pause-transport-death",
   "tool-pause-clean-exit",
+  "interaction-query-continue",
+  "exec-server-control",
 ] as const;
 
 export interface FakeCursorServer {
@@ -74,6 +83,8 @@ export interface FakeCursorServer {
   setScenario: (scenario: CursorScenario) => void;
   assertClean: () => void;
   close: () => Promise<void>;
+  /** Model ids observed on every Run request, in arrival order. */
+  getRunRequestModelIds: () => string[];
   /** Test-only resource accounting hooks for proving cleanup assertions fire. */
   trackChild: (pid: number) => void;
   untrackChild: (pid: number) => void;
@@ -141,6 +152,45 @@ function turnEnded(): Buffer {
   });
 }
 
+function webSearchQuery(): Buffer {
+  return serverMessage({
+    message: {
+      case: "interactionQuery",
+      value: create(InteractionQuerySchema, {
+        id: 41,
+        query: { case: "webSearchRequestQuery", value: {} },
+      }),
+    },
+  });
+}
+
+function execServerControl(): Buffer {
+  return serverMessage({
+    message: {
+      case: "execServerControlMessage",
+      value: create(ExecServerControlMessageSchema, {
+        message: { case: "abort", value: { id: 77 } },
+      }),
+    },
+  });
+}
+
+function hasRejectedWebSearchResponse(chunk: Buffer): boolean {
+  if (chunk.length < 5 || chunk.readUInt32BE(1) !== chunk.length - 5) return false;
+  try {
+    const message = fromBinary(AgentClientMessageSchema, chunk.subarray(5));
+    if (message.message.case !== "interactionResponse") return false;
+    const response = message.message.value;
+    return response.id === 41 &&
+      response.result.case === "webSearchRequestResponse" &&
+      response.result.value.result.case === "rejected" &&
+      response.result.value.result.value.reason ===
+        "Not available via the OpenCode Cursor bridge. Use the provided MCP tools instead.";
+  } catch {
+    return false;
+  }
+}
+
 function checkpoint(): Buffer {
   return serverMessage({
     message: {
@@ -177,6 +227,43 @@ function isScenario(value: string): value is CursorScenario {
 }
 
 /**
+ * Extract the model id from every Run request frame in a Connect-framed
+ * client payload. The proxy sends each Run request as a framed
+ * AgentClientMessage; heartbeats and other client messages are skipped.
+ */
+function decodeRunRequestModelIds(bytes: Buffer): string[] {
+  const ids: string[] = [];
+  let offset = 0;
+  while (offset + 5 <= bytes.length) {
+    const flags = bytes[offset]!;
+    const view = new DataView(
+      bytes.buffer,
+      bytes.byteOffset + offset,
+      bytes.byteLength - offset,
+    );
+    const messageLength = view.getUint32(1, false);
+    const frameEnd = offset + 5 + messageLength;
+    if (frameEnd > bytes.length) break;
+    if ((flags & 0b0000_0010) === 0) {
+      const payload = bytes.subarray(offset + 5, frameEnd);
+      if (payload.length > 0) {
+        try {
+          const decoded = fromBinary(AgentClientMessageSchema, payload);
+          if (decoded.message.case === "runRequest") {
+            const modelId =
+              decoded.message.value.requestedModel?.modelId ??
+              decoded.message.value.modelDetails?.modelId;
+            if (modelId) ids.push(modelId);
+          }
+        } catch {}
+      }
+    }
+    offset = frameEnd;
+  }
+  return ids;
+}
+
+/**
  * A local Connect-over-H2 server with bounded failure sequences. The request header
  * x-fake-cursor-scenario selects a scenario; setScenario supplies the default.
  */
@@ -187,6 +274,7 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
   const streams = new Set<http2.ServerHttp2Stream>();
   const childPids = new Set<number>();
   const bridgeEntries = new Set<string>();
+  const runRequestModelIds: string[] = [];
   let defaultScenario: CursorScenario = "clean-end-stream";
   let toolPauseCount = 0;
 
@@ -206,6 +294,17 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
       stream.end();
       return;
     }
+
+    // Record which model id the proxy routed to Cursor on every Run request.
+    const requestChunks: Buffer[] = [];
+    stream.on("data", (chunk) => requestChunks.push(Buffer.from(chunk)));
+    stream.once("close", () => {
+      if (requestChunks.length > 0) {
+        runRequestModelIds.push(
+          ...decodeRunRequestModelIds(Buffer.concat(requestChunks)),
+        );
+      }
+    });
 
     const requested = String(headers["x-fake-cursor-scenario"] ?? defaultScenario);
     const scenario = isScenario(requested) ? requested : defaultScenario;
@@ -247,6 +346,26 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
         stream.end(Buffer.concat([
           frameConnectMessage(textDelta(receivedExpectedResult ? "resumed-correctly" : "resumed-with-wrong-result")),
           frameConnectEndStream(new TextEncoder().encode("{}")),
+        ]));
+      });
+      return;
+    }
+
+    if (scenario === "interaction-query-continue") {
+      let receivedInitialRequest = false;
+      stream.on("data", (chunk) => {
+        if (!receivedInitialRequest) {
+          receivedInitialRequest = true;
+          stream.write(frameConnectMessage(webSearchQuery()));
+          return;
+        }
+        stream.end(Buffer.concat([
+          frameConnectMessage(textDelta(
+            hasRejectedWebSearchResponse(Buffer.from(chunk))
+              ? "after-query-refusal"
+              : "unexpected-query-response",
+          )),
+          frameConnectMessage(turnEnded()),
         ]));
       });
       return;
@@ -336,14 +455,37 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
       case "heartbeat-trickle-kept-open":
         trickleUntilClosed(heartbeat());
         break;
-      case "turn-ended-kept-open":
-        stream.write(frameConnectMessage(turnEnded()));
+      case "turn-ended-semantic-stall":
+        // Reproduces Cursor's normal-looking completion shape: text and
+        // turnEnded arrive, but the HTTP/2 response remains open with no
+        // Connect end-stream. The proxy's current turnEnded no-op must leave
+        // the semantic-progress watchdog as the only terminal owner.
+        stream.write(Buffer.concat([
+          frameConnectMessage(textDelta("before-turn-ended-stall")),
+          frameConnectMessage(turnEnded()),
+        ]));
+        break;
+      case "turn-ended-transport-close":
+        // A close after Cursor's completion signal must not change the already
+        // clean terminal outcome. Retain the session before the proxy releases
+        // the bridge so this scenario can still deliver the late close.
+        const session = stream.session;
+        stream.write(Buffer.concat([
+          frameConnectMessage(textDelta("before-turn-ended-close")),
+          frameConnectMessage(turnEnded()),
+        ]));
+        setTimeout(() => session.destroy(), 10);
+        break;
+      case "exec-server-control":
+        stream.write(frameConnectMessage(execServerControl()));
         break;
       case "checkpoint-trickle":
         trickle(checkpoint());
         break;
-      case "abrupt-session-close":
-        stream.write(frameConnectMessage(textDelta("before-close")));
+      case "transport-close-without-terminal":
+        // No turnEnded or Connect end-stream: this is an abnormal transport
+        // failure and must reach proxy.ts finishTerminal's explicit-error path.
+        stream.write(frameConnectMessage(textDelta("before-terminal-less-close")));
         setTimeout(() => stream.session.destroy(), 10);
         break;
       case "frame-error":
@@ -379,6 +521,7 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
   return {
     apiUrl: `http://127.0.0.1:${port}`,
     setScenario(scenario) { defaultScenario = scenario; },
+    getRunRequestModelIds() { return [...runRequestModelIds]; },
     trackChild(pid) { childPids.add(pid); },
     untrackChild(pid) { childPids.delete(pid); },
     trackBridgeEntry(key) { bridgeEntries.add(key); },
