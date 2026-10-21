@@ -19,23 +19,34 @@ import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
   AgentServerMessageSchema,
+  AskQuestionInteractionResponseSchema,
+  AskQuestionRejectedSchema,
+  AskQuestionResultSchema,
   ClientHeartbeatSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
   ConversationStepSchema,
   AgentConversationTurnStructureSchema,
   ConversationTurnStructureSchema,
+  CreatePlanErrorSchema,
+  CreatePlanRequestResponseSchema,
+  CreatePlanResultSchema,
   AssistantMessageSchema,
   BackgroundShellSpawnResultSchema,
   DeleteResultSchema,
   DeleteRejectedSchema,
   DiagnosticsResultSchema,
+  ExaFetchRequestResponse_RejectedSchema,
+  ExaFetchRequestResponseSchema,
+  ExaSearchRequestResponse_RejectedSchema,
+  ExaSearchRequestResponseSchema,
   ExecClientMessageSchema,
   FetchErrorSchema,
   FetchResultSchema,
   GetBlobResultSchema,
   GrepErrorSchema,
   GrepResultSchema,
+  InteractionResponseSchema,
   KvClientMessageSchema,
   LsRejectedSchema,
   LsResultSchema,
@@ -54,6 +65,8 @@ import {
   RequestContextSuccessSchema,
   ResumeActionSchema,
   SetBlobResultSchema,
+  SwitchModeRequestResponse_RejectedSchema,
+  SwitchModeRequestResponseSchema,
   ShellRejectedSchema,
   ShellResultSchema,
   UserMessageActionSchema,
@@ -62,9 +75,13 @@ import {
   WriteResultSchema,
   WriteShellStdinErrorSchema,
   WriteShellStdinResultSchema,
+  WebSearchRequestResponse_RejectedSchema,
+  WebSearchRequestResponseSchema,
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerMessage,
+  type InteractionQuery,
+  type InteractionResponse,
   type InteractionUpdate,
   type KvServerMessage,
   type McpToolDefinition,
@@ -1202,6 +1219,7 @@ export function processServerMessage(
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
   onProtocolError?: (error: Error) => void,
+  onTurnEnded?: () => void,
 ): void {
   const markSemanticProgress = () => {
     state.semanticProgressCount += 1;
@@ -1210,7 +1228,7 @@ export function processServerMessage(
 
   switch (msg.message.case) {
     case "interactionUpdate":
-      handleInteractionUpdate(msg.message.value, state, onText, markSemanticProgress);
+      handleInteractionUpdate(msg.message.value, state, onText, markSemanticProgress, onTurnEnded);
       return;
     case "kvServerMessage":
       handleKvMessage(msg.message.value, blobStore, sendFrame);
@@ -1231,9 +1249,7 @@ export function processServerMessage(
       onProtocolError?.(new Error(`Unsupported Cursor exec control message: ${msg.message.value.message.case ?? "unknown"}`));
       return;
     case "interactionQuery":
-      // Query answers may require user interaction or Cursor-specific capabilities that
-      // this proxy cannot provide. Never silently leave the server waiting for one.
-      onProtocolError?.(new Error(`Unsupported Cursor interaction query: ${msg.message.value.query.case ?? "unknown"}`));
+      handleInteractionQuery(msg.message.value, sendFrame, onProtocolError);
       return;
     case undefined:
       // Protobuf decoders represent empty or forward-compatible messages as an
@@ -1248,11 +1264,95 @@ export function processServerMessage(
   }
 }
 
+const INTERACTION_QUERY_REJECTION =
+  "Not available via the OpenCode Cursor bridge. Use the provided MCP tools instead.";
+
+/** Refuse unprivileged IDE-native queries so Cursor can continue the current turn. */
+function handleInteractionQuery(
+  query: InteractionQuery,
+  sendFrame: (data: Uint8Array) => void,
+  onProtocolError?: (error: Error) => void,
+): void {
+  let result: InteractionResponse["result"];
+  switch (query.query.case) {
+    case "webSearchRequestQuery":
+      result = {
+        case: "webSearchRequestResponse",
+        value: create(WebSearchRequestResponseSchema, {
+          result: { case: "rejected", value: create(WebSearchRequestResponse_RejectedSchema, { reason: INTERACTION_QUERY_REJECTION }) },
+        }),
+      };
+      break;
+    case "askQuestionInteractionQuery":
+      result = {
+        case: "askQuestionInteractionResponse",
+        value: create(AskQuestionInteractionResponseSchema, {
+          result: create(AskQuestionResultSchema, {
+            result: { case: "rejected", value: create(AskQuestionRejectedSchema, { reason: INTERACTION_QUERY_REJECTION }) },
+          }),
+        }),
+      };
+      break;
+    case "switchModeRequestQuery":
+      result = {
+        case: "switchModeRequestResponse",
+        value: create(SwitchModeRequestResponseSchema, {
+          result: { case: "rejected", value: create(SwitchModeRequestResponse_RejectedSchema, { reason: INTERACTION_QUERY_REJECTION }) },
+        }),
+      };
+      break;
+    case "exaSearchRequestQuery":
+      result = {
+        case: "exaSearchRequestResponse",
+        value: create(ExaSearchRequestResponseSchema, {
+          result: { case: "rejected", value: create(ExaSearchRequestResponse_RejectedSchema, { reason: INTERACTION_QUERY_REJECTION }) },
+        }),
+      };
+      break;
+    case "exaFetchRequestQuery":
+      result = {
+        case: "exaFetchRequestResponse",
+        value: create(ExaFetchRequestResponseSchema, {
+          result: { case: "rejected", value: create(ExaFetchRequestResponse_RejectedSchema, { reason: INTERACTION_QUERY_REJECTION }) },
+        }),
+      };
+      break;
+    case "createPlanRequestQuery":
+      result = {
+        case: "createPlanRequestResponse",
+        value: create(CreatePlanRequestResponseSchema, {
+          result: create(CreatePlanResultSchema, {
+            result: { case: "error", value: create(CreatePlanErrorSchema, { error: INTERACTION_QUERY_REJECTION }) },
+          }),
+        }),
+      };
+      break;
+    // This response has no rejection arm. Claiming success would authorize work
+    // that this proxy did not perform.
+    case "setupVmEnvironmentArgs":
+      onProtocolError?.(new Error("Unsupported Cursor interaction query: setupVmEnvironmentArgs"));
+      return;
+    case undefined:
+      onProtocolError?.(new Error("Unsupported Cursor interaction query: unknown"));
+      return;
+    default: {
+      const unhandled: never = query.query;
+      throw new Error(`Unhandled Cursor interaction query: ${String(unhandled)}`);
+    }
+  }
+  const response = create(InteractionResponseSchema, { id: query.id, result });
+  const clientMessage = create(AgentClientMessageSchema, {
+    message: { case: "interactionResponse", value: response },
+  });
+  sendFrame(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+}
+
 function handleInteractionUpdate(
   update: InteractionUpdate,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
   markSemanticProgress: () => void,
+  onTurnEnded?: () => void,
 ): void {
   switch (update.message.case) {
     case "textDelta": {
@@ -1291,9 +1391,13 @@ function handleInteractionUpdate(
     case "shellOutputDelta":
     case "stepStarted":
     case "stepCompleted":
-    // Cursor's turnEnded sequencing is unproven, so only a Connect end-stream may terminate.
     case "heartbeat":
+      return;
+    // Cursor emits this after normal completion and can leave its HTTP/2 stream
+    // open without a Connect end-stream. The response owner supplies an
+    // idempotent terminal callback so a later transport close stays inert.
     case "turnEnded":
+      onTurnEnded?.();
       return;
     case undefined:
       return;
@@ -1665,6 +1769,13 @@ function createBridgeStreamResponse(
         lastSemanticProgressAt: Date.now(),
       };
       const tagFilter = createThinkingTagFilter();
+      const persistLiveConversation = () => {
+        const stored = conversationStates.get(convKey);
+        if (!stored) return;
+        for (const [k, v] of blobStore) stored.blobStore.set(k, v);
+        stored.lastAccessMs = Date.now();
+        persistConversation(convKey, stored);
+      };
 
       let mcpExecReceived = false;
       let connectEndStreamReceived = false;
@@ -1676,6 +1787,7 @@ function createBridgeStreamResponse(
         terminal = true;
         semanticWatchdog.clear();
         clearInterval(heartbeatTimer);
+        persistLiveConversation();
         for (const active of activeBridges.values()) {
           if (active.bridge === bridge) removeActiveBridge(active);
         }
@@ -1787,16 +1899,14 @@ function createBridgeStreamResponse(
                 const stored = conversationStates.get(convKey);
                 if (stored) {
                   stored.checkpoint = checkpointBytes;
-                  // Merge live blobs before persisting: the checkpoint may
-                  // reference blobs set during this stream.
-                  for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-                  stored.lastAccessMs = Date.now();
-                  persistConversation(convKey, stored);
+                  // The checkpoint may reference blobs set during this stream.
+                  persistLiveConversation();
                 }
               },
               finishTerminal,
+              () => finishTerminal(),
             );
-            semanticWatchdog.observe();
+            if (!terminal) semanticWatchdog.observe();
             emitLifecycleDiagnostic("proxy", "message_dispatch", {
               messageCase: serverMessage.message.case,
               interactionCase: serverMessage.message.case === "interactionUpdate"
@@ -1835,12 +1945,7 @@ function createBridgeStreamResponse(
         emitLifecycleDiagnostic("proxy", "terminal", { exitCode: code });
         semanticWatchdog.clear();
         clearInterval(heartbeatTimer);
-        const stored = conversationStates.get(convKey);
-        if (stored) {
-          for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-          stored.lastAccessMs = Date.now();
-          persistConversation(convKey, stored);
-        }
+        persistLiveConversation();
         if (terminal) return;
         if (mcpExecReceived) {
           // Tool pause deliberately owns neither terminal cleanup nor bridge
@@ -2105,8 +2210,9 @@ async function collectFullResponse(
           (error) => {
             finishCollection(error);
           },
+          () => finishCollection(),
         );
-        semanticWatchdog.observe();
+        if (!settled) semanticWatchdog.observe();
       } catch (error) {
         // A complete Connect frame with an invalid protobuf payload cannot be
         // safely ignored in unary mode either: it may contain the only

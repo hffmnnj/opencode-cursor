@@ -5,9 +5,11 @@ import {
   AgentClientMessageSchema,
   AgentServerMessageSchema,
   ConversationStateStructureSchema,
+  ExecServerControlMessageSchema,
   ExecServerMessageSchema,
   HeartbeatUpdateSchema,
   InteractionUpdateSchema,
+  InteractionQuerySchema,
   McpArgsSchema,
   TextDeltaUpdateSchema,
   TurnEndedUpdateSchema,
@@ -29,9 +31,10 @@ export type CursorScenario =
   | "semantic-progress-trickle"
   | "heartbeat-trickle"
   | "heartbeat-trickle-kept-open"
-  | "turn-ended-kept-open"
+  | "turn-ended-semantic-stall"
+  | "turn-ended-transport-close"
   | "checkpoint-trickle"
-  | "abrupt-session-close"
+  | "transport-close-without-terminal"
   | "frame-error"
   | "goaway"
   | "stream-aborted"
@@ -40,7 +43,9 @@ export type CursorScenario =
   | "transport-death"
   | "tool-pause-resume"
   | "tool-pause-transport-death"
-  | "tool-pause-clean-exit";
+  | "tool-pause-clean-exit"
+  | "interaction-query-continue"
+  | "exec-server-control";
 
 export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "clean-end-stream",
@@ -56,9 +61,10 @@ export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "semantic-progress-trickle",
   "heartbeat-trickle",
   "heartbeat-trickle-kept-open",
-  "turn-ended-kept-open",
+  "turn-ended-semantic-stall",
+  "turn-ended-transport-close",
   "checkpoint-trickle",
-  "abrupt-session-close",
+  "transport-close-without-terminal",
   "frame-error",
   "goaway",
   "stream-aborted",
@@ -68,6 +74,8 @@ export const CURSOR_SCENARIOS: readonly CursorScenario[] = [
   "tool-pause-resume",
   "tool-pause-transport-death",
   "tool-pause-clean-exit",
+  "interaction-query-continue",
+  "exec-server-control",
 ] as const;
 
 export interface FakeCursorServer {
@@ -142,6 +150,45 @@ function turnEnded(): Buffer {
       }),
     },
   });
+}
+
+function webSearchQuery(): Buffer {
+  return serverMessage({
+    message: {
+      case: "interactionQuery",
+      value: create(InteractionQuerySchema, {
+        id: 41,
+        query: { case: "webSearchRequestQuery", value: {} },
+      }),
+    },
+  });
+}
+
+function execServerControl(): Buffer {
+  return serverMessage({
+    message: {
+      case: "execServerControlMessage",
+      value: create(ExecServerControlMessageSchema, {
+        message: { case: "abort", value: { id: 77 } },
+      }),
+    },
+  });
+}
+
+function hasRejectedWebSearchResponse(chunk: Buffer): boolean {
+  if (chunk.length < 5 || chunk.readUInt32BE(1) !== chunk.length - 5) return false;
+  try {
+    const message = fromBinary(AgentClientMessageSchema, chunk.subarray(5));
+    if (message.message.case !== "interactionResponse") return false;
+    const response = message.message.value;
+    return response.id === 41 &&
+      response.result.case === "webSearchRequestResponse" &&
+      response.result.value.result.case === "rejected" &&
+      response.result.value.result.value.reason ===
+        "Not available via the OpenCode Cursor bridge. Use the provided MCP tools instead.";
+  } catch {
+    return false;
+  }
 }
 
 function checkpoint(): Buffer {
@@ -304,6 +351,26 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
       return;
     }
 
+    if (scenario === "interaction-query-continue") {
+      let receivedInitialRequest = false;
+      stream.on("data", (chunk) => {
+        if (!receivedInitialRequest) {
+          receivedInitialRequest = true;
+          stream.write(frameConnectMessage(webSearchQuery()));
+          return;
+        }
+        stream.end(Buffer.concat([
+          frameConnectMessage(textDelta(
+            hasRejectedWebSearchResponse(Buffer.from(chunk))
+              ? "after-query-refusal"
+              : "unexpected-query-response",
+          )),
+          frameConnectMessage(turnEnded()),
+        ]));
+      });
+      return;
+    }
+
     const endWith = (body: Uint8Array) => stream.end(frameConnectEndStream(body));
     const trickle = (payload: Buffer) => {
       let sent = 0;
@@ -388,14 +455,37 @@ export async function createFakeCursorServer(options: { deadlineMs?: number } = 
       case "heartbeat-trickle-kept-open":
         trickleUntilClosed(heartbeat());
         break;
-      case "turn-ended-kept-open":
-        stream.write(frameConnectMessage(turnEnded()));
+      case "turn-ended-semantic-stall":
+        // Reproduces Cursor's normal-looking completion shape: text and
+        // turnEnded arrive, but the HTTP/2 response remains open with no
+        // Connect end-stream. The proxy's current turnEnded no-op must leave
+        // the semantic-progress watchdog as the only terminal owner.
+        stream.write(Buffer.concat([
+          frameConnectMessage(textDelta("before-turn-ended-stall")),
+          frameConnectMessage(turnEnded()),
+        ]));
+        break;
+      case "turn-ended-transport-close":
+        // A close after Cursor's completion signal must not change the already
+        // clean terminal outcome. Retain the session before the proxy releases
+        // the bridge so this scenario can still deliver the late close.
+        const session = stream.session;
+        stream.write(Buffer.concat([
+          frameConnectMessage(textDelta("before-turn-ended-close")),
+          frameConnectMessage(turnEnded()),
+        ]));
+        setTimeout(() => session.destroy(), 10);
+        break;
+      case "exec-server-control":
+        stream.write(frameConnectMessage(execServerControl()));
         break;
       case "checkpoint-trickle":
         trickle(checkpoint());
         break;
-      case "abrupt-session-close":
-        stream.write(frameConnectMessage(textDelta("before-close")));
+      case "transport-close-without-terminal":
+        // No turnEnded or Connect end-stream: this is an abnormal transport
+        // failure and must reach proxy.ts finishTerminal's explicit-error path.
+        stream.write(frameConnectMessage(textDelta("before-terminal-less-close")));
         setTimeout(() => stream.session.destroy(), 10);
         break;
       case "frame-error":

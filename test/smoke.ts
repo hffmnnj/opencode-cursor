@@ -14,6 +14,7 @@ import {
   KvServerMessageSchema,
   ModelDetailsSchema,
   TextDeltaUpdateSchema,
+  SetupVmEnvironmentArgsSchema,
   ThinkingDetailsSchema,
   TurnEndedUpdateSchema,
 } from "../src/proto/agent_pb";
@@ -548,6 +549,10 @@ function doneCount(body: string): number {
   return body.split("data: [DONE]").length - 1;
 }
 
+function errorCount(body: string): number {
+  return body.split("[Error:").length - 1;
+}
+
 async function observeProxyScenario(
   scenario: CursorScenario,
   deadlineMs = 125,
@@ -640,10 +645,12 @@ async function testStreamingTermination() {
   assertEqual(doneCount(malformedMessage.body), 1, "Malformed protobuf payloads must emit exactly one [DONE]");
   console.log("[test] Malformed protobuf payloads terminate explicitly exactly once");
 
-  const abruptClose = await observeProxyScenario("abrupt-session-close");
-  assert(abruptClose.body.includes("[Error:"), "Abrupt HTTP/2 closure must be surfaced as an error");
-  assertEqual(doneCount(abruptClose.body), 1, "Abrupt HTTP/2 closure must emit exactly one [DONE]");
-  console.log("[test] Abrupt HTTP/2 closure is an explicit error exactly once");
+  const terminalLessClose = await observeProxyScenario("transport-close-without-terminal");
+  assert(terminalLessClose.body.includes("before-terminal-less-close"), "Terminal-less closure must preserve preceding text");
+  assert(terminalLessClose.body.includes("[Error:"), "Closure without turnEnded or Connect end-stream must be surfaced as an error");
+  assertEqual(errorCount(terminalLessClose.body), 1, "Closure without a terminal signal must emit exactly one explicit error");
+  assertEqual(doneCount(terminalLessClose.body), 1, "Closure without a terminal signal must emit exactly one [DONE]");
+  console.log("[test] Terminal-less transport closure reaches finishTerminal as an explicit error exactly once");
 
   const frameError = await observeProxyScenario("frame-error");
   assert(frameError.body.includes("[Error:"), "HTTP/2 frame errors must be surfaced as an error");
@@ -687,10 +694,40 @@ async function testStreamingTermination() {
   assertEqual(doneCount(firstProgressStall.body), 1, "First-progress stalls must emit exactly one [DONE]");
   console.log("[test] First-progress stalls are bounded independently of transport liveness");
 
-  const turnEnded = await observeProxyScenario("turn-ended-kept-open");
-  assert(turnEnded.body.includes("[Error:"), "turnEnded transport closure must not become a clean success");
-  assertEqual(doneCount(turnEnded.body), 1, "turnEnded transport closure must emit exactly one [DONE]");
-  console.log("[test] turnEnded transport closure is an explicit error exactly once");
+  const turnEndedStall = await observeProxyScenario("turn-ended-semantic-stall", 250, {
+    CURSOR_PROXY_FIRST_PROGRESS_TIMEOUT_MS: "1000",
+    CURSOR_PROXY_SEMANTIC_PROGRESS_TIMEOUT_MS: "25",
+    CURSOR_BRIDGE_SESSION_TIMEOUT_MS: "1000",
+    CURSOR_BRIDGE_PING_INTERVAL_MS: "1000",
+  });
+  assert(!turnEndedStall.timedOut, "turnEnded without Connect end-stream must terminate promptly");
+  assert(turnEndedStall.body.includes("before-turn-ended-stall"), "turnEnded stall fixture must deliver the preceding text delta");
+  assertEqual(errorCount(turnEndedStall.body), 0, "turnEnded must complete cleanly before the semantic watchdog");
+  assert(turnEndedStall.body.includes('"finish_reason":"stop"'), "turnEnded must emit a stop terminal chunk");
+  assert(turnEndedStall.body.includes('"usage":'), "turnEnded must emit a usage terminal chunk");
+  assertEqual(doneCount(turnEndedStall.body), 1, "turnEnded must emit exactly one [DONE]");
+  console.log("[test] turnEnded completes the open response before the semantic watchdog");
+
+  const turnEndedClose = await observeProxyScenario("turn-ended-transport-close");
+  assert(turnEndedClose.body.includes("before-turn-ended-close"), "turnEnded transport-close fixture must deliver the preceding text delta");
+  assertEqual(errorCount(turnEndedClose.body), 0, "Transport closure after turnEnded must stay clean and idempotent");
+  assert(turnEndedClose.body.includes('"finish_reason":"stop"'), "turnEnded transport-close must emit a stop terminal chunk");
+  assert(turnEndedClose.body.includes('"usage":'), "turnEnded transport-close must emit a usage terminal chunk");
+  assertEqual(doneCount(turnEndedClose.body), 1, "turnEnded followed by transport closure must emit exactly one [DONE]");
+  console.log("[test] turnEnded followed by transport closure remains clean exactly once");
+
+  const refusedQuery = await observeProxyScenario("interaction-query-continue");
+  assert(!refusedQuery.timedOut, "A safely refused interaction query must let the same turn continue");
+  assert(refusedQuery.body.includes("after-query-refusal"), "The server must continue after its typed query rejection");
+  assertEqual(errorCount(refusedQuery.body), 0, "A safely refused query must not produce an SSE error");
+  assertEqual(doneCount(refusedQuery.body), 1, "A safely refused query followed by turnEnded must emit exactly one [DONE]");
+  console.log("[test] Typed interaction-query refusal continues to a clean turnEnded terminal");
+
+  const unsupportedControl = await observeProxyScenario("exec-server-control");
+  assert(unsupportedControl.body.includes("Unsupported Cursor exec control message: abort"), "Unsupported server controls must surface an explicit error");
+  assertEqual(errorCount(unsupportedControl.body), 1, "Unsupported server controls must emit exactly one explicit error");
+  assertEqual(doneCount(unsupportedControl.body), 1, "Unsupported server controls must emit exactly one [DONE]");
+  console.log("[test] Unsupported server controls terminate with one explicit error and one [DONE]");
 
   const slowProgress = await observeProxyScenario("slow-semantic-progress", 500);
   assert(!slowProgress.timedOut, "Slow semantic progress exceeded its bounded completion window");
@@ -790,11 +827,28 @@ async function testServerMessageClassification(modules: TestModules) {
   assertEqual(state.semanticProgressCount, 1, "Text output must count as semantic progress");
 
   let unsupportedError: Error | undefined;
+  const safeQueryCases = [
+    "webSearchRequestQuery",
+    "askQuestionInteractionQuery",
+    "switchModeRequestQuery",
+    "exaSearchRequestQuery",
+    "exaFetchRequestQuery",
+    "createPlanRequestQuery",
+  ] as const;
+  for (const queryCase of safeQueryCases) {
+    let responseBytes: Uint8Array | undefined;
+    dispatch({ message: { case: "interactionQuery", value: create(InteractionQuerySchema, {
+      id: 1,
+      query: { case: queryCase, value: {} },
+    }) } }, (error) => { unsupportedError = error; }, (bytes) => { responseBytes = bytes; });
+    assert(!unsupportedError, `${queryCase} must be safely refused rather than terminal`);
+    assert(responseBytes && responseBytes.length > 5, `${queryCase} must emit a typed interaction response`);
+  }
   dispatch({ message: { case: "interactionQuery", value: create(InteractionQuerySchema, {
     id: 1,
-    query: { case: "webSearchRequestQuery", value: {} },
+    query: { case: "setupVmEnvironmentArgs", value: create(SetupVmEnvironmentArgsSchema, {}) },
   }) } }, (error) => { unsupportedError = error; });
-  assert(unsupportedError?.message.includes("Unsupported Cursor interaction query"), "Unsupported blocking queries must trigger an explicit terminal error");
+  assertEqual(unsupportedError?.message, "Unsupported Cursor interaction query: setupVmEnvironmentArgs", "VM setup must remain an explicit terminal error because its response has no rejection arm");
   unsupportedError = undefined;
   dispatch({ message: { case: "execServerControlMessage", value: create(ExecServerControlMessageSchema, {
     message: { case: "abort", value: { id: 1 } },
@@ -828,7 +882,7 @@ async function testServerMessageClassification(modules: TestModules) {
     "Failed to write native tool result to Cursor bridge",
     "A dead bridge must explicitly reject native tool-result writes",
   );
-  console.log("[test] Liveness traffic is non-progress and unsupported queries terminate explicitly");
+  console.log("[test] Liveness traffic is non-progress; safe queries reject-and-continue while controls fail explicitly");
 }
 
 async function runScenarioSubprocess(
